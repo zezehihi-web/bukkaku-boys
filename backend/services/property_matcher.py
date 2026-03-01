@@ -1,4 +1,4 @@
-"""ATBB物件マッチングエンジン
+"""ATBB物件マッチングエンジン（SQLite版）
 
 マッチング優先順位:
 1. 物件名が一致 → 即確定（ベスト）
@@ -6,13 +6,13 @@
 3. 築年数で追加検証 → ほぼ100%で特定
 """
 
-import json
 import re
 from datetime import datetime
 from difflib import SequenceMatcher
-from pathlib import Path
 
-from backend.config import ATBB_JSON_PATH
+import aiosqlite
+
+from backend.config import DB_PATH
 
 # 漢数字→アラビア数字
 _KANJI_NUM = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
@@ -133,16 +133,31 @@ def _clean_property_name(name: str) -> str:
     return name.strip()
 
 
-def load_atbb_data() -> list[dict]:
-    """ATBBデータベースを読み込み"""
-    path = Path(ATBB_JSON_PATH)
-    if not path.exists():
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+def _row_to_dict(row) -> dict:
+    """aiosqlite.Row → dict（ATBBフォーマット互換）"""
+    return {
+        "名前": row["name"] or "",
+        "号室": row["room_number"] or "",
+        "賃料": row["rent"] or "",
+        "管理費等": row["management_fee"] or "",
+        "敷金": row["deposit"] or "",
+        "礼金": row["key_money"] or "",
+        "間取り": row["layout"] or "",
+        "専有面積": row["area"] or "",
+        "階建/階": row["floors"] or "",
+        "所在地": row["address"] or "",
+        "築年月": row["build_year"] or "",
+        "交通": row["transport"] or "",
+        "建物構造": row["structure"] or "",
+        "取引態様": row["transaction_type"] or "",
+        "管理会社情報": row["management_company"] or "",
+        "公開日": row["publish_date"] or "",
+        "物件番号": row["property_id"] or "",
+        "抽出県": row["prefecture"] or "",
+    }
 
 
-def match_property(
+async def match_property(
     property_name: str,
     address: str,
     rent: str,
@@ -150,7 +165,7 @@ def match_property(
     layout: str,
     build_year_text: str = "",
 ) -> dict | None:
-    """物件情報をATBBデータベースから検索
+    """物件情報をATBBデータベース(SQLite)から検索
 
     マッチング戦略:
     1. 物件名マッチ → 即確定
@@ -158,125 +173,161 @@ def match_property(
     3. 築年数で追加検証 → 確定
 
     Returns:
-        マッチしたATBBレコード or None
+        マッチしたATBBレコード(dict) or None
     """
-    atbb_data = load_atbb_data()
-    if not atbb_data:
-        return None
-
     target_name = _clean_property_name(property_name)
     target_district = _extract_address_district(address)
     target_area = _extract_area_m2(area)
     target_build_year = _extract_build_year(build_year_text)
 
-    # === 戦略1: 物件名マッチ ===
-    if target_name:
-        best_name_match = None
-        best_name_score = 0.0
+    async with aiosqlite.connect(str(DB_PATH)) as db:
+        db.row_factory = aiosqlite.Row
 
-        for prop in atbb_data:
-            atbb_name = _clean_property_name(prop.get("名前", ""))
-            if not atbb_name:
-                continue
+        # === 戦略1: 物件名マッチ ===
+        if target_name:
+            # まず完全一致を試す
+            cursor = await db.execute(
+                "SELECT * FROM atbb_properties WHERE status='募集中' AND name = ?",
+                (target_name,)
+            )
+            exact = await cursor.fetchone()
+            if exact:
+                return _row_to_dict(exact)
 
-            # 完全一致
-            if target_name == atbb_name:
-                return prop
+            # LIKE検索で候補を取得
+            cursor = await db.execute(
+                "SELECT * FROM atbb_properties WHERE status='募集中' AND name LIKE ?",
+                (f"%{target_name}%",)
+            )
+            candidates = await cursor.fetchall()
 
-            # 高い類似度
-            sim = _similarity(target_name, atbb_name)
-            if sim >= 0.85 and sim > best_name_score:
-                best_name_score = sim
-                best_name_match = prop
+            # 逆方向のLIKE検索も実施（target_nameがATBB名に含まれるケースもカバー）
+            if not candidates and len(target_name) >= 4:
+                cursor = await db.execute(
+                    "SELECT * FROM atbb_properties WHERE status='募集中' AND ? LIKE '%' || name || '%'",
+                    (target_name,)
+                )
+                candidates = await cursor.fetchall()
 
-            # 部分一致（短い方が長い方に含まれる）
-            elif len(target_name) >= 4 and len(atbb_name) >= 4:
-                if target_name in atbb_name or atbb_name in target_name:
-                    inclusion_score = min(len(target_name), len(atbb_name)) / max(len(target_name), len(atbb_name))
-                    if inclusion_score >= 0.5 and inclusion_score > best_name_score:
-                        best_name_score = inclusion_score
-                        best_name_match = prop
+            best_name_match = None
+            best_name_score = 0.0
 
-        if best_name_match and best_name_score >= 0.85:
-            return best_name_match
+            for row in candidates:
+                atbb_name = _clean_property_name(row["name"] or "")
+                if not atbb_name:
+                    continue
 
-    # === 戦略2: 住所（丁目）+ 専有面積 ===
-    if target_district and target_area is not None:
-        candidates = []
+                if target_name == atbb_name:
+                    return _row_to_dict(row)
 
-        for prop in atbb_data:
-            atbb_district = _extract_address_district(prop.get("所在地", ""))
-            if not atbb_district:
-                continue
+                sim = _similarity(target_name, atbb_name)
+                if sim >= 0.85 and sim > best_name_score:
+                    best_name_score = sim
+                    best_name_match = row
 
-            # 丁目レベルで一致確認
-            if target_district != atbb_district:
-                continue
+                elif len(target_name) >= 4 and len(atbb_name) >= 4:
+                    if target_name in atbb_name or atbb_name in target_name:
+                        inclusion_score = min(len(target_name), len(atbb_name)) / max(len(target_name), len(atbb_name))
+                        if inclusion_score >= 0.5 and inclusion_score > best_name_score:
+                            best_name_score = inclusion_score
+                            best_name_match = row
 
-            # 同じ丁目の物件を発見 → 面積で絞り込み
-            atbb_area = _extract_area_m2(prop.get("専有面積", ""))
-            if atbb_area is None:
-                continue
+            if best_name_match and best_name_score >= 0.85:
+                return _row_to_dict(best_name_match)
 
-            area_diff = abs(target_area - atbb_area)
-            if area_diff <= 1.0:  # ±1㎡以内
-                candidates.append((prop, area_diff))
+        # === 戦略2: 住所（丁目）+ 専有面積 ===
+        if target_district and target_area is not None:
+            # 住所にtarget_districtを含む物件を検索
+            cursor = await db.execute(
+                "SELECT * FROM atbb_properties WHERE status='募集中' AND address LIKE ?",
+                (f"%{target_district}%",)
+            )
+            addr_candidates = await cursor.fetchall()
 
-        if len(candidates) == 1:
-            # 候補が1件 → 確定
-            return candidates[0][0]
+            area_matches = []
+            for row in addr_candidates:
+                atbb_district = _extract_address_district(row["address"] or "")
+                if target_district != atbb_district:
+                    continue
 
-        if len(candidates) > 1:
-            # 候補が複数 → 築年数で絞り込み
+                atbb_area = _extract_area_m2(row["area"] or "")
+                if atbb_area is None:
+                    continue
+
+                area_diff = abs(target_area - atbb_area)
+                if area_diff <= 1.0:
+                    area_matches.append((row, area_diff))
+
+            if len(area_matches) == 1:
+                return _row_to_dict(area_matches[0][0])
+
+            if len(area_matches) > 1:
+                if target_build_year is not None:
+                    for row, area_diff in area_matches:
+                        atbb_build_year = _extract_build_year(row["build_year"] or "")
+                        if atbb_build_year and abs(target_build_year - atbb_build_year) <= 1:
+                            return _row_to_dict(row)
+
+                area_matches.sort(key=lambda x: x[1])
+                return _row_to_dict(area_matches[0][0])
+
+        # === 戦略3: フォールバック（スコアリング） ===
+        # 全件スキャンは避け、名前/住所の部分一致で候補を絞る
+        fallback_candidates = []
+
+        if target_name and len(target_name) >= 3:
+            # 名前の最初の3文字で候補を絞る
+            prefix = target_name[:3]
+            cursor = await db.execute(
+                "SELECT * FROM atbb_properties WHERE status='募集中' AND name LIKE ?",
+                (f"%{prefix}%",)
+            )
+            fallback_candidates.extend(await cursor.fetchall())
+
+        if target_district:
+            # 住所district中のキーワードで候補追加
+            cursor = await db.execute(
+                "SELECT * FROM atbb_properties WHERE status='募集中' AND address LIKE ?",
+                (f"%{target_district[:5]}%",)
+            )
+            for row in await cursor.fetchall():
+                # 重複を避ける
+                if not any(r["id"] == row["id"] for r in fallback_candidates):
+                    fallback_candidates.append(row)
+
+        best_fallback = None
+        best_fallback_score = 0.0
+
+        for row in fallback_candidates:
+            score = 0.0
+            atbb_name = _clean_property_name(row["name"] or "")
+
+            if target_name and atbb_name:
+                name_sim = _similarity(target_name, atbb_name)
+                score += 50.0 * name_sim
+
+            atbb_district = _extract_address_district(row["address"] or "")
+            if target_district and atbb_district:
+                if target_district == atbb_district:
+                    score += 25.0
+                elif _similarity(target_district, atbb_district) >= 0.7:
+                    score += 15.0
+
+            if target_area is not None:
+                atbb_area = _extract_area_m2(row["area"] or "")
+                if atbb_area is not None and abs(target_area - atbb_area) <= 1.0:
+                    score += 10.0
+
             if target_build_year is not None:
-                for prop, area_diff in candidates:
-                    atbb_build_year = _extract_build_year(prop.get("築年月", ""))
-                    if atbb_build_year and abs(target_build_year - atbb_build_year) <= 1:
-                        return prop
+                atbb_build_year = _extract_build_year(row["build_year"] or "")
+                if atbb_build_year and abs(target_build_year - atbb_build_year) <= 1:
+                    score += 10.0
 
-            # 築年数で絞れなかった場合 → 面積が最も近いものを返す
-            candidates.sort(key=lambda x: x[1])
-            return candidates[0][0]
+            if score > best_fallback_score:
+                best_fallback_score = score
+                best_fallback = row
 
-    # === 戦略3: フォールバック（スコアリング） ===
-    best_fallback = None
-    best_fallback_score = 0.0
-
-    for prop in atbb_data:
-        score = 0.0
-        atbb_name = _clean_property_name(prop.get("名前", ""))
-
-        # 名前の類似度
-        if target_name and atbb_name:
-            name_sim = _similarity(target_name, atbb_name)
-            score += 50.0 * name_sim
-
-        # 住所の類似度
-        atbb_district = _extract_address_district(prop.get("所在地", ""))
-        if target_district and atbb_district:
-            if target_district == atbb_district:
-                score += 25.0
-            elif _similarity(target_district, atbb_district) >= 0.7:
-                score += 15.0
-
-        # 面積
-        if target_area is not None:
-            atbb_area = _extract_area_m2(prop.get("専有面積", ""))
-            if atbb_area is not None and abs(target_area - atbb_area) <= 1.0:
-                score += 10.0
-
-        # 築年数
-        if target_build_year is not None:
-            atbb_build_year = _extract_build_year(prop.get("築年月", ""))
-            if atbb_build_year and abs(target_build_year - atbb_build_year) <= 1:
-                score += 10.0
-
-        if score > best_fallback_score:
-            best_fallback_score = score
-            best_fallback = prop
-
-    # 最低35点（物件名の類似度0.7相当 or 住所+面積+築年数）
-    if best_fallback_score >= 35.0:
-        return best_fallback
+        if best_fallback_score >= 35.0:
+            return _row_to_dict(best_fallback)
 
     return None

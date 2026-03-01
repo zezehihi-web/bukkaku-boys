@@ -120,7 +120,7 @@ async def _step_match(
     build_year_text: str = "",
 ):
     """ステップ2: ATBB照合"""
-    matched = match_property(property_name, address, rent, area, layout, build_year_text)
+    matched = await match_property(property_name, address, rent, area, layout, build_year_text)
 
     if not matched:
         await _update_status(

@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import json
+import sqlite3
 import requests
 import hashlib
 import signal
@@ -9,6 +10,7 @@ import io
 import re
 from datetime import datetime
 from urllib.parse import urlparse
+from pathlib import Path
 
 # OCRライブラリのインポート（オプション）- 後で初期化
 OCR_AVAILABLE = False
@@ -93,14 +95,15 @@ TARGET_PREFECTURES = [
     ("14", "神奈川県")
 ]
 
-# 結果ファイルパス（固定）
+# 結果ファイルパス（SQLite + JSON互換）
 RESULTS_DIR = "results"
 JSON_FILEPATH = os.path.join(RESULTS_DIR, "properties_database_list.json")
+DB_PATH = str(Path(__file__).resolve().parent / "backend" / "akikaku.db")
 
 # ========= Chrome設定 =========
 print("🔧 Chrome設定を開始します...")
 
-def human_delay(min_sec=0.3, max_sec=0.8):
+def human_delay(min_sec=0.1, max_sec=0.3):
     """人間らしいランダムな待機時間（高速化版）"""
     time.sleep(random.uniform(min_sec, max_sec))
 
@@ -187,8 +190,9 @@ def check_and_wait_for_captcha():
         if captcha_found:
             print("\n" + "="*50)
             print("⚠️ reCAPTCHA が検出されました！")
-            print("   ブラウザ画面で「私はロボットではありません」をクリックして手動解決してください。")
-            input(">> CAPTCHAを解決したらEnterキーを押してください...")
+            print("   自動で30秒待機します（手動解決をお待ちしています）...")
+            # 全自動モード: input()は使わず、待機のみ
+            time.sleep(30)
             human_delay(0.5, 1.0)
             return True
     except:
@@ -196,7 +200,7 @@ def check_and_wait_for_captcha():
     return False
 
 # ============================================================================
-# 差分更新（インクリメンタル）機能
+# 差分更新（インクリメンタル）機能 — SQLite版
 # ============================================================================
 def make_property_key(prop):
     """物件の一意キーを生成（名前+号室+所在地）"""
@@ -205,82 +209,215 @@ def make_property_key(prop):
     addr = prop.get('所在地', '')
     return f"{name}|{room}|{addr}"
 
-def load_existing_data():
-    """既存のJSONデータを読み込む"""
-    if os.path.exists(JSON_FILEPATH):
-        try:
-            with open(JSON_FILEPATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            print(f"📂 既存データを読み込みました: {len(data)}件")
-            return data
-        except Exception as e:
-            print(f"⚠️ 既存データ読み込みエラー: {e}")
-    return []
 
-def merge_and_save(new_properties, existing_properties):
-    """新規スクレイピング結果と既存データをマージし、差分更新する
+def _get_db():
+    """SQLite接続を取得（同期版）"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    - 今回取得できた物件 → 追加または更新
-    - 既存にあったが今回出てこなかった物件 → 削除（=最新のみ保持）
+
+def upsert_properties_to_db(properties, prefecture):
+    """スクレイプ結果をSQLiteにupsert（同期版）
+
+    - 既存物件: last_seen + フィールド更新
+    - 新規物件: INSERT（物件名変更の検出あり）
+    - 戻り値: 今回upsertしたproperty_keyのセット
     """
-    # 今回取得した物件のキーセット
-    new_keys = {}
-    for prop in new_properties:
-        key = make_property_key(prop)
-        if key and key != '||':
-            new_keys[key] = prop
-
-    # 既存データのキーセット
-    existing_keys = {}
-    for prop in existing_properties:
-        key = make_property_key(prop)
-        if key and key != '||':
-            existing_keys[key] = prop
-
-    # 統計
-    added = 0
+    now = datetime.now().isoformat()
+    inserted = 0
     updated = 0
-    deleted = 0
-    unchanged = 0
+    name_changed = 0
+    current_keys = set()
 
-    final_properties = []
+    conn = _get_db()
+    try:
+        cursor = conn.cursor()
+        for prop in properties:
+            key = make_property_key(prop)
+            if not key or key == '||':
+                continue
+            current_keys.add(key)
 
-    for key, prop in new_keys.items():
-        if key in existing_keys:
-            # 既存にあった → 更新（新しいデータで上書き）
-            updated += 1
+            # 既存レコード確認
+            cursor.execute(
+                "SELECT id, name, name_history FROM atbb_properties WHERE property_key = ?",
+                (key,)
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                # UPDATE: last_seen更新 + フィールド上書き
+                cursor.execute("""
+                    UPDATE atbb_properties SET
+                        rent=?, management_fee=?, deposit=?, key_money=?,
+                        layout=?, area=?, floors=?, address=?,
+                        build_year=?, transport=?, structure=?,
+                        transaction_type=?, management_company=?,
+                        publish_date=?, property_id=?, prefecture=?,
+                        status='募集中', last_seen=?, updated_at=?
+                    WHERE property_key = ?
+                """, (
+                    prop.get('賃料', ''), prop.get('管理費等', ''),
+                    prop.get('敷金', ''), prop.get('礼金', ''),
+                    prop.get('間取り', ''), prop.get('専有面積', ''),
+                    prop.get('階建/階', ''), prop.get('所在地', ''),
+                    prop.get('築年月', ''), prop.get('交通', ''),
+                    prop.get('建物構造', ''), prop.get('取引態様', ''),
+                    prop.get('管理会社情報', ''), prop.get('公開日', ''),
+                    prop.get('物件番号', ''), prefecture,
+                    now, now, key,
+                ))
+                updated += 1
+            else:
+                # 新規物件 → 物件名変更の検出
+                addr = prop.get('所在地', '')
+                area = prop.get('専有面積', '')
+                build_yr = prop.get('築年月', '')
+
+                alt_match = None
+                if addr and area and build_yr:
+                    cursor.execute("""
+                        SELECT id, name, name_history, property_key
+                        FROM atbb_properties
+                        WHERE address = ? AND area = ? AND build_year = ?
+                        AND status = '募集中'
+                    """, (addr, area, build_yr))
+                    alt_match = cursor.fetchone()
+
+                if alt_match:
+                    # 物件名変更として処理
+                    old_name = alt_match['name']
+                    new_name = prop.get('名前', '')
+                    history = json.loads(alt_match['name_history'] or '[]')
+                    history.append({
+                        "old": old_name,
+                        "new": new_name,
+                        "date": now,
+                    })
+                    cursor.execute("""
+                        UPDATE atbb_properties SET
+                            property_key=?, name=?, room_number=?,
+                            rent=?, management_fee=?, deposit=?, key_money=?,
+                            layout=?, area=?, floors=?, address=?,
+                            build_year=?, transport=?, structure=?,
+                            transaction_type=?, management_company=?,
+                            publish_date=?, property_id=?, prefecture=?,
+                            status='募集中', last_seen=?, updated_at=?,
+                            name_history=?
+                        WHERE id = ?
+                    """, (
+                        key, new_name, prop.get('号室', ''),
+                        prop.get('賃料', ''), prop.get('管理費等', ''),
+                        prop.get('敷金', ''), prop.get('礼金', ''),
+                        prop.get('間取り', ''), prop.get('専有面積', ''),
+                        prop.get('階建/階', ''), prop.get('所在地', ''),
+                        prop.get('築年月', ''), prop.get('交通', ''),
+                        prop.get('建物構造', ''), prop.get('取引態様', ''),
+                        prop.get('管理会社情報', ''), prop.get('公開日', ''),
+                        prop.get('物件番号', ''), prefecture,
+                        now, now,
+                        json.dumps(history, ensure_ascii=False),
+                        alt_match['id'],
+                    ))
+                    # 旧キーを現在のキーに差し替え
+                    current_keys.discard(alt_match['property_key'])
+                    current_keys.add(key)
+                    name_changed += 1
+                    print(f"   🔄 物件名変更検出: {old_name} → {new_name}")
+                else:
+                    # 完全新規物件
+                    cursor.execute("""
+                        INSERT INTO atbb_properties (
+                            property_key, name, room_number,
+                            rent, management_fee, deposit, key_money,
+                            layout, area, floors, address,
+                            build_year, transport, structure,
+                            transaction_type, management_company,
+                            publish_date, property_id, prefecture,
+                            status, first_seen, last_seen
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        key, prop.get('名前', ''), prop.get('号室', ''),
+                        prop.get('賃料', ''), prop.get('管理費等', ''),
+                        prop.get('敷金', ''), prop.get('礼金', ''),
+                        prop.get('間取り', ''), prop.get('専有面積', ''),
+                        prop.get('階建/階', ''), prop.get('所在地', ''),
+                        prop.get('築年月', ''), prop.get('交通', ''),
+                        prop.get('建物構造', ''), prop.get('取引態様', ''),
+                        prop.get('管理会社情報', ''), prop.get('公開日', ''),
+                        prop.get('物件番号', ''), prefecture,
+                        '募集中', now, now,
+                    ))
+                    inserted += 1
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    print(f"   📊 DB更新: 新規{inserted} / 更新{updated} / 名前変更{name_changed}")
+    return current_keys
+
+
+def mark_disappeared_properties(prefecture, current_keys):
+    """今回のスクレイプで見つからなかった物件を募集終了にマーク
+
+    ※ 物件はDBから削除せず、statusを'募集終了'に変更するだけ
+    """
+    now = datetime.now().isoformat()
+    conn = _get_db()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT property_key FROM atbb_properties
+            WHERE prefecture = ? AND status = '募集中'
+        """, (prefecture,))
+        all_keys = {row['property_key'] for row in cursor.fetchall()}
+
+        disappeared = all_keys - current_keys
+        if disappeared:
+            placeholders = ','.join('?' * len(disappeared))
+            cursor.execute(f"""
+                UPDATE atbb_properties SET status = '募集終了', updated_at = ?
+                WHERE property_key IN ({placeholders})
+            """, [now] + list(disappeared))
+            conn.commit()
+            print(f"   📋 {prefecture}: {len(disappeared)}件を募集終了にマーク")
         else:
-            # 新規物件
-            added += 1
-        final_properties.append(prop)
+            print(f"   📋 {prefecture}: 募集終了の物件なし")
+    finally:
+        conn.close()
 
-    # 既存にあったが今回出てこなかった物件はカウントするが含めない（削除）
-    for key in existing_keys:
-        if key not in new_keys:
-            deleted += 1
 
-    print(f"\n📊 差分更新結果:")
-    print(f"   新規追加: {added}件")
-    print(f"   更新: {updated}件")
-    print(f"   削除（掲載終了）: {deleted}件")
-    print(f"   最終件数: {len(final_properties)}件")
+def get_db_count(prefecture=None):
+    """DB内のレコード数を取得"""
+    conn = _get_db()
+    try:
+        if prefecture:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM atbb_properties WHERE prefecture = ? AND status = '募集中'",
+                (prefecture,)
+            )
+        else:
+            cursor = conn.execute("SELECT COUNT(*) FROM atbb_properties WHERE status = '募集中'")
+        return cursor.fetchone()[0]
+    finally:
+        conn.close()
 
-    return final_properties
+
+def load_existing_data():
+    """既存データの件数を確認（互換性のため残す）"""
+    count = get_db_count()
+    if count > 0:
+        print(f"📂 既存DBデータ: {count}件（募集中）")
+    return count
+
 
 def save_data_to_files():
-    """全データを JSON ファイルに保存"""
-    global all_properties
-
-    if not all_properties:
-        return
-
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-
-    try:
-        with open(JSON_FILEPATH, 'w', encoding='utf-8') as f:
-            json.dump(all_properties, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"      ⚠️ JSON保存エラー: {e}")
+    """中間保存 — SQLite版ではページごとにupsert済みのため不要
+    （互換性のため空関数として残す）
+    """
+    pass
 
 # ============================================================================
 # 賃料テキストの正規化
@@ -371,7 +508,7 @@ def extract_rent_from_image(img_element):
 # 一覧ページではマスクされている物件名(AT)・住所(▲)・賃料(画像)を
 # 詳細ページにアクセスして正式な情報を取得する
 # ============================================================================
-ENRICH_DETAILS = True  # 詳細ページで物件情報を補完するか
+ENRICH_DETAILS = False  # 詳細ページ補完はスキップ（高速化: リスト一覧のみで十分）
 
 # エラー統計カウンタ
 enrich_stats = {
@@ -504,7 +641,7 @@ def enrich_property_from_detail(drv, wait_obj, prop_data, button_index=None, btn
             drv.execute_script("arguments[0].click();", detail_btn)
 
         wait_and_accept_alert()
-        human_delay(2.0, 3.0)
+        human_delay(1.0, 2.0)
 
         # 新タブが開いたか確認（最大5秒待つ）
         new_tab_found = False
@@ -787,7 +924,7 @@ def enrich_property_from_detail(drv, wait_obj, prop_data, button_index=None, btn
                 drv.switch_to.window(original_handle)
             else:
                 drv.back()
-                human_delay(1.0, 2.0)
+                human_delay(0.5, 1.0)
                 try:
                     WebDriverWait(drv, 10).until(
                         lambda d: d.execute_script("return document.readyState") == "complete"
@@ -984,7 +1121,7 @@ def find_and_extract_properties(drv):
                 // 最後のカードも確実に描画
                 cards[cards.length - 1].scrollIntoView({behavior: 'instant'});
             """)
-            time.sleep(1.0)
+            time.sleep(0.5)
         else:
             drv.execute_script("""
                 var cards = document.querySelectorAll('.property_card');
@@ -992,9 +1129,9 @@ def find_and_extract_properties(drv):
                     cards[cards.length - 1].scrollIntoView();
                 }
             """)
-            time.sleep(0.5)
+            time.sleep(0.3)
         drv.execute_script("window.scrollTo(0, 0);")
-        time.sleep(0.3)
+        time.sleep(0.2)
     except Exception:
         pass
 
@@ -1032,7 +1169,7 @@ def find_and_extract_properties(drv):
                 }
                 window.scrollTo(0, 0);
             """)
-            time.sleep(1.5)
+            time.sleep(0.8)
             raw_items_retry = drv.execute_script(JS_EXTRACT_ALL)
             if raw_items_retry:
                 # 再試行結果の品質チェック
@@ -1357,7 +1494,7 @@ try:
 
     # 流通物件検索ボタンを探す
     try:
-        human_delay(0.5, 1.0)
+        human_delay(0.3, 0.5)
         ryutsuu_btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.XPATH, "//div[contains(@data-action, '/atbb/nyushuSearch') and contains(., '流通物件検索')]"))
         )
@@ -1366,16 +1503,16 @@ try:
         except:
             driver.execute_script("arguments[0].click();", ryutsuu_btn)
         print("🏠 流通物件検索をクリック")
-        human_delay(1.0, 2.0)
+        human_delay(0.5, 1.0)
         wait_and_accept_alert()
     except Exception as e:
         print(f"⚠️ 流通物件検索ボタンが見つかりませんでした: {e}")
         print("  → 直接URLで遷移を試みます...")
         driver.get(TARGET_URL)
-        human_delay(1.5, 2.5)
+        human_delay(0.5, 1.0)
 
     # タブ切替（新しいタブが開く場合の対応）
-    human_delay(0.5, 1.0)
+    human_delay(0.3, 0.5)
     print(f"  → 現在のタブ数: {len(driver.window_handles)}")
 
     try:
@@ -1393,7 +1530,7 @@ try:
             pass
     else:
         print("  → 同じタブで続行します")
-        human_delay(1.0, 2.0)
+        human_delay(0.5, 1.0)
 
     # 同時ログインエラー（強制終了画面）が出た場合の対応
     if "ConcurrentLoginException.jsp" in driver.current_url:
@@ -1429,10 +1566,11 @@ try:
 
         prefecture_failed = False
         prefecture_count_before = len(all_properties)
+        prefecture_keys = set()  # この県で今回見つかった物件キーを追跡
 
         # 物件検索ページへ
         driver.get(TARGET_URL)
-        human_delay(1.0, 2.0)
+        human_delay(0.5, 1.0)
         wait_and_accept_alert()
 
         print("⚙️ 種目・エリア設定中...")
@@ -1470,7 +1608,7 @@ try:
             continue
 
         wait_and_accept_alert()
-        human_delay(2.0, 3.0)
+        human_delay(1.0, 1.5)
 
         # ページ読み込み完了を待つ
         try:
@@ -1497,7 +1635,7 @@ try:
             # 条件入力画面へ
             wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[value='条件入力画面へ']"))).click()
             wait_and_accept_alert()
-            human_delay(1.0, 2.0)
+            human_delay(0.5, 1.0)
         except Exception as e:
             print(f"⚠️ 市区郡全選択エラー: {e}")
             continue
@@ -1523,7 +1661,7 @@ try:
             WebDriverWait(driver, 30).until(
                 lambda d: d.current_url != current_url or len(d.find_elements(By.ID, "tbl")) > 0
             )
-            human_delay(2.0, 3.0)
+            human_delay(1.0, 1.5)
             print("✓ 検索結果画面へ遷移成功")
         except Exception as e:
             print(f"⚠️ 検索実行エラー: {e}")
@@ -1541,7 +1679,7 @@ try:
                 WebDriverWait(driver, 20).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                human_delay(1.0, 2.0)
+                human_delay(0.5, 1.0)
                 wait_and_accept_alert()
                 display_count_changed = True
             except Exception as e:
@@ -1551,6 +1689,7 @@ try:
         # 一覧画面のスクレイピングループ
         # ---------------------------------------------------------
         page = 1
+        prefecture_page_properties = []  # この県のページ物件を一時保持
 
         while not interrupted:
             print(f"📄 {prefecture_name} - {page}ページ目を取得中...")
@@ -1562,7 +1701,7 @@ try:
                 )
             except:
                 pass
-            human_delay(0.5, 1.0)
+            human_delay()
 
             # === 物件カード検出＆抽出（Selenium直接方式） ===
             page_properties = find_and_extract_properties(driver)
@@ -1586,14 +1725,14 @@ try:
                 retry_success = False
                 for retry in range(3):
                     print(f"⚠️ 物件カードが検出できません → リトライ {retry+1}/3 ...")
-                    human_delay(3.0, 5.0)
+                    human_delay(2.0, 3.0)
                     # ページリロード
                     try:
                         driver.refresh()
                         WebDriverWait(driver, 15).until(
                             lambda d: d.execute_script("return document.readyState") == "complete"
                         )
-                        human_delay(2.0, 3.0)
+                        human_delay(1.0, 2.0)
                     except:
                         pass
                     page_properties = find_and_extract_properties(driver)
@@ -1614,9 +1753,7 @@ try:
             for prop in page_properties:
                 prop['抽出県'] = prefecture_name
 
-            # === 詳細ページで物件情報を補完 ===
-            # 新DOM構造では一覧ページで大半のデータが取得可能
-            # 詳細ページは物件名・住所・賃料が欠損している場合のみ
+            # === 詳細ページエンリッチメント（高速化のためデフォルトOFF） ===
             if ENRICH_DETAILS:
                 enriched_count = 0
                 for i, prop in enumerate(page_properties):
@@ -1626,55 +1763,37 @@ try:
                     addr = prop.get('所在地', '')
                     rent = prop.get('賃料', '')
                     company = prop.get('管理会社情報', '')
-
-                    # 不足データの判定
                     name_missing = (not name or name in ('AT', 'AT ', '', '(詳細ページで取得)') or len(name) <= 2)
                     addr_missing = (not addr or '▲' in addr or len(addr) <= 3)
                     rent_missing = (not rent or rent == '要確認')
                     company_missing = (not company)
-
-                    # 1つでも不足があれば詳細ページにアクセス
                     needs_enrich = name_missing or addr_missing or rent_missing or company_missing
-
                     if needs_enrich:
-                        missing_fields = []
-                        if name_missing: missing_fields.append('名前')
-                        if addr_missing: missing_fields.append('住所')
-                        if rent_missing: missing_fields.append('賃料')
-                        if company_missing: missing_fields.append('管理会社')
-                        print(f"      🔍 詳細取得 ({i+1}/{len(page_properties)}): {name or '(名前なし)'} [不足: {', '.join(missing_fields)}]")
                         prop_btn_id = prop.get('_btn_id', '')
                         prop = enrich_property_from_detail(driver, wait, prop, button_index=i, btn_id=prop_btn_id)
                         page_properties[i] = prop
                         enriched_count += 1
                 if enriched_count > 0:
                     print(f"   ✅ {enriched_count}件の物件情報を詳細ページで補完しました")
-                    print_enrich_stats()
-
-            # === デバッグ: enrichment後のデータ品質チェック ===
-            areas_after = set(p.get('専有面積', '') for p in page_properties if p.get('専有面積'))
-            layouts_after = set(p.get('間取り', '') for p in page_properties if p.get('間取り'))
-            print(f"      [DEBUG] enrichment後: ユニーク面積={len(areas_after)}種, ユニーク間取り={len(layouts_after)}種 / {len(page_properties)}件")
-            if len(areas_after) == 1 and len(page_properties) > 5:
-                print(f"      ⚠️ [DEBUG] データ破損の疑い！全物件が同一面積: {areas_after.pop()}")
 
             # _btn_id一時フィールドを削除
             for prop in page_properties:
                 prop.pop('_btn_id', None)
 
+            # === SQLiteにupsert（ページ単位で即時保存） ===
+            page_keys = upsert_properties_to_db(page_properties, prefecture_name)
+            prefecture_keys.update(page_keys)
+
             added_count = len(page_properties)
             all_properties.extend(page_properties)
+            prefecture_page_properties.extend(page_properties)
 
-            print(f"   => {added_count}件の物件データを追加 (総計: {len(all_properties)}件)")
+            print(f"   => {added_count}件を処理 (県内総計: {len(prefecture_page_properties)}件, 全体: {len(all_properties)}件)")
 
             # テストモード: 上限チェック
             if TEST_MODE and len(all_properties) >= TEST_LIMIT:
                 print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました。ループ終了。")
                 break
-
-            # 5ページごとに中間保存
-            if page % 5 == 0:
-                save_data_to_files()
 
             # 次のページへ
             next_btn = None
@@ -1702,40 +1821,34 @@ try:
                 print("ℹ️ 次へボタンがないため、終了します")
                 break
 
-        prefecture_count_added = len(all_properties) - prefecture_count_before
+        # === 県ごとの差分更新: 見つからなかった物件を募集終了に ===
+        prefecture_count_added = len(prefecture_page_properties)
         if prefecture_failed:
-            print(f"❌ {prefecture_name}: 取得失敗（{prefecture_count_added}件）")
+            print(f"❌ {prefecture_name}: 取得失敗（{prefecture_count_added}件）— 募集終了マークはスキップ")
         elif prefecture_count_added == 0:
-            print(f"⚠️ {prefecture_name}: 0件（該当物件なし or 取得失敗）")
+            print(f"⚠️ {prefecture_name}: 0件（該当物件なし or 取得失敗）— 募集終了マークはスキップ")
         else:
             print(f"✅ {prefecture_name}: {prefecture_count_added}件 取得完了")
+            # 成功した県のみ、見つからなかった物件を募集終了にマーク
+            mark_disappeared_properties(prefecture_name, prefecture_keys)
 
     # ---------------------------------------------------------
-    # 差分更新＆最終保存
+    # 最終サマリー
     # ---------------------------------------------------------
-    if all_properties:
-        if existing_data:
-            # 差分マージ（今回取得できなかった物件は削除される）
-            all_properties = merge_and_save(all_properties, existing_data)
-        else:
-            print(f"\n📊 初回実行: {len(all_properties)}件の物件を保存します")
-
-        save_data_to_files()
-        print(f"\n🎉 完了！ データは {JSON_FILEPATH} に保存されました。")
-        print(f"   最終物件数: {len(all_properties)}件")
-        if ENRICH_DETAILS:
-            print_enrich_stats()
-    else:
+    total_db = get_db_count()
+    print(f"\n🎉 完了！ データは SQLite ({DB_PATH}) に保存されました。")
+    print(f"   今回処理: {len(all_properties)}件")
+    print(f"   DB内募集中物件: {total_db}件")
+    if not all_properties:
         print("\n⚠️ 物件データが取得できませんでした")
 
 except KeyboardInterrupt:
-    print("\n\n⚠️ 中断されました。データを保存して終了します。")
-    save_data_to_files()
+    print("\n\n⚠️ 中断されました。SQLiteに既に保存済みです。")
 except Exception as e:
     import traceback
     print(f"❌ エラー発生: {e}")
     traceback.print_exc()
-    save_data_to_files()
+    print("   SQLiteに既に保存済みのデータは保持されます。")
 finally:
     try:
         if driver: driver.quit()

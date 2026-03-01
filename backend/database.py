@@ -51,6 +51,42 @@ CREATE TABLE IF NOT EXISTS phone_tasks (
     completed_at    DATETIME,
     FOREIGN KEY (check_request_id) REFERENCES check_requests(id)
 );
+
+CREATE TABLE IF NOT EXISTS atbb_properties (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    property_key        TEXT NOT NULL UNIQUE,
+    name                TEXT DEFAULT '',
+    room_number         TEXT DEFAULT '',
+    rent                TEXT DEFAULT '',
+    management_fee      TEXT DEFAULT '',
+    deposit             TEXT DEFAULT '',
+    key_money           TEXT DEFAULT '',
+    layout              TEXT DEFAULT '',
+    area                TEXT DEFAULT '',
+    floors              TEXT DEFAULT '',
+    address             TEXT DEFAULT '',
+    build_year          TEXT DEFAULT '',
+    transport           TEXT DEFAULT '',
+    structure           TEXT DEFAULT '',
+    transaction_type    TEXT DEFAULT '',
+    management_company  TEXT DEFAULT '',
+    publish_date        TEXT DEFAULT '',
+    property_id         TEXT DEFAULT '',
+    prefecture          TEXT DEFAULT '',
+    status              TEXT DEFAULT '募集中',
+    first_seen          TEXT NOT NULL,
+    last_seen           TEXT NOT NULL,
+    name_history        TEXT DEFAULT '[]',
+    created_at          TEXT DEFAULT (datetime('now','localtime')),
+    updated_at          TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_atbb_prop_key ON atbb_properties(property_key);
+CREATE INDEX IF NOT EXISTS idx_atbb_name ON atbb_properties(name);
+CREATE INDEX IF NOT EXISTS idx_atbb_address ON atbb_properties(address);
+CREATE INDEX IF NOT EXISTS idx_atbb_status ON atbb_properties(status);
+CREATE INDEX IF NOT EXISTS idx_atbb_prefecture ON atbb_properties(prefecture);
+CREATE INDEX IF NOT EXISTS idx_atbb_last_seen ON atbb_properties(last_seen);
 """
 
 # 既存テーブルに新カラムを追加するマイグレーション
