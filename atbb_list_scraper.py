@@ -1427,6 +1427,9 @@ try:
         print(f"🗺️ 【{prefecture_name}】 のスクレイピングを開始します (ID: {area_id})")
         print(f"==============================================")
 
+        prefecture_failed = False
+        prefecture_count_before = len(all_properties)
+
         # 物件検索ページへ
         driver.get(TARGET_URL)
         human_delay(1.0, 2.0)
@@ -1499,17 +1502,14 @@ try:
             print(f"⚠️ 市区郡全選択エラー: {e}")
             continue
 
-        # 条件入力画面 (客付HP)
-        print("📝 客付不動産会社HPにチェックを入れて検索...")
+        # 条件入力画面 → チェックボックスは何も入れず、そのまま検索
+        print("📝 条件未指定で検索実行...")
         check_and_wait_for_captcha()
 
         try:
             wait.until(EC.presence_of_element_located((By.NAME, "bfcm370s001")))
-            hp_check = driver.find_element(By.CSS_SELECTOR, "input[name='kokokuTensaiTaSite'][value='2']")
-            if not hp_check.is_selected():
-                driver.execute_script("arguments[0].click();", hp_check)
 
-            # 検索実行
+            # 検索実行（チェックボックスは何も入れない）
             current_url = driver.current_url
             try:
                 btn = driver.find_element(By.CSS_SELECTOR, "input[value='検索']")
@@ -1523,6 +1523,7 @@ try:
             WebDriverWait(driver, 30).until(
                 lambda d: d.current_url != current_url or len(d.find_elements(By.ID, "tbl")) > 0
             )
+            human_delay(2.0, 3.0)
             print("✓ 検索結果画面へ遷移成功")
         except Exception as e:
             print(f"⚠️ 検索実行エラー: {e}")
@@ -1580,8 +1581,34 @@ try:
                 if driver.find_elements(By.XPATH, "//*[contains(text(), '該当する物件がありません')]"):
                     print("ℹ️ 該当物件なし")
                     break
-                print(f"⚠️ 物件カードが検出できません（ボタン数: {len(driver.find_elements(By.TAG_NAME, 'button'))}）")
-                break
+
+                # リトライ: ページ読み込みが遅い可能性があるので再試行
+                retry_success = False
+                for retry in range(3):
+                    print(f"⚠️ 物件カードが検出できません → リトライ {retry+1}/3 ...")
+                    human_delay(3.0, 5.0)
+                    # ページリロード
+                    try:
+                        driver.refresh()
+                        WebDriverWait(driver, 15).until(
+                            lambda d: d.execute_script("return document.readyState") == "complete"
+                        )
+                        human_delay(2.0, 3.0)
+                    except:
+                        pass
+                    page_properties = find_and_extract_properties(driver)
+                    if page_properties:
+                        print(f"✓ リトライ{retry+1}回目で {len(page_properties)}件 検出成功")
+                        retry_success = True
+                        break
+
+                if not retry_success:
+                    btn_count = len(driver.find_elements(By.TAG_NAME, 'button'))
+                    card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
+                    print(f"❌ 物件カードが検出できません（button数: {btn_count}, .property_card数: {card_count}）")
+                    print(f"   現在のURL: {driver.current_url}")
+                    prefecture_failed = True
+                    break
 
             # 県情報を付与
             for prop in page_properties:
@@ -1675,7 +1702,13 @@ try:
                 print("ℹ️ 次へボタンがないため、終了します")
                 break
 
-        print(f"✅ {prefecture_name}の処理が完了しました")
+        prefecture_count_added = len(all_properties) - prefecture_count_before
+        if prefecture_failed:
+            print(f"❌ {prefecture_name}: 取得失敗（{prefecture_count_added}件）")
+        elif prefecture_count_added == 0:
+            print(f"⚠️ {prefecture_name}: 0件（該当物件なし or 取得失敗）")
+        else:
+            print(f"✅ {prefecture_name}: {prefecture_count_added}件 取得完了")
 
     # ---------------------------------------------------------
     # 差分更新＆最終保存
