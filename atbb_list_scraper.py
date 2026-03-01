@@ -169,6 +169,31 @@ def wait_and_accept_alert():
     except:
         return False
 
+def wait_for_page_ready(drv, timeout=10, max_retries=2):
+    """ページ読み込み完了を待機（スタック対策付き）
+
+    Chromeタブがクルクル回り続けてreadyStateがcompleteにならない場合、
+    timeout秒後に自動リロードしてリトライする。
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            WebDriverWait(drv, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            return True  # 読み込み完了
+        except Exception:
+            if attempt < max_retries:
+                print(f"   ⚠️ ページ読み込みが{timeout}秒以上かかっています → リロード試行 ({attempt+1}/{max_retries})")
+                try:
+                    drv.refresh()
+                    time.sleep(2)
+                except Exception:
+                    pass
+            else:
+                print(f"   ⚠️ ページ読み込みタイムアウト（{max_retries}回リロード後も完了せず）→ 続行")
+                return False
+
+
 def check_and_wait_for_captcha():
     try:
         captcha_selectors = [
@@ -221,13 +246,12 @@ def upsert_properties_to_db(properties, prefecture):
     """スクレイプ結果をSQLiteにupsert（同期版）
 
     - 既存物件: last_seen + フィールド更新
-    - 新規物件: INSERT（物件名変更の検出あり）
+    - 新規物件: INSERT
     - 戻り値: 今回upsertしたproperty_keyのセット
     """
     now = datetime.now().isoformat()
     inserted = 0
     updated = 0
-    name_changed = 0
     current_keys = set()
 
     conn = _get_db()
@@ -241,7 +265,7 @@ def upsert_properties_to_db(properties, prefecture):
 
             # 既存レコード確認
             cursor.execute(
-                "SELECT id, name, name_history FROM atbb_properties WHERE property_key = ?",
+                "SELECT id FROM atbb_properties WHERE property_key = ?",
                 (key,)
             )
             existing = cursor.fetchone()
@@ -270,92 +294,36 @@ def upsert_properties_to_db(properties, prefecture):
                 ))
                 updated += 1
             else:
-                # 新規物件 → 物件名変更の検出
-                addr = prop.get('所在地', '')
-                area = prop.get('専有面積', '')
-                build_yr = prop.get('築年月', '')
-
-                alt_match = None
-                if addr and area and build_yr:
-                    cursor.execute("""
-                        SELECT id, name, name_history, property_key
-                        FROM atbb_properties
-                        WHERE address = ? AND area = ? AND build_year = ?
-                        AND status = '募集中'
-                    """, (addr, area, build_yr))
-                    alt_match = cursor.fetchone()
-
-                if alt_match:
-                    # 物件名変更として処理
-                    old_name = alt_match['name']
-                    new_name = prop.get('名前', '')
-                    history = json.loads(alt_match['name_history'] or '[]')
-                    history.append({
-                        "old": old_name,
-                        "new": new_name,
-                        "date": now,
-                    })
-                    cursor.execute("""
-                        UPDATE atbb_properties SET
-                            property_key=?, name=?, room_number=?,
-                            rent=?, management_fee=?, deposit=?, key_money=?,
-                            layout=?, area=?, floors=?, address=?,
-                            build_year=?, transport=?, structure=?,
-                            transaction_type=?, management_company=?,
-                            publish_date=?, property_id=?, prefecture=?,
-                            status='募集中', last_seen=?, updated_at=?,
-                            name_history=?
-                        WHERE id = ?
-                    """, (
-                        key, new_name, prop.get('号室', ''),
-                        prop.get('賃料', ''), prop.get('管理費等', ''),
-                        prop.get('敷金', ''), prop.get('礼金', ''),
-                        prop.get('間取り', ''), prop.get('専有面積', ''),
-                        prop.get('階建/階', ''), prop.get('所在地', ''),
-                        prop.get('築年月', ''), prop.get('交通', ''),
-                        prop.get('建物構造', ''), prop.get('取引態様', ''),
-                        prop.get('管理会社情報', ''), prop.get('公開日', ''),
-                        prop.get('物件番号', ''), prefecture,
-                        now, now,
-                        json.dumps(history, ensure_ascii=False),
-                        alt_match['id'],
-                    ))
-                    # 旧キーを現在のキーに差し替え
-                    current_keys.discard(alt_match['property_key'])
-                    current_keys.add(key)
-                    name_changed += 1
-                    print(f"   🔄 物件名変更検出: {old_name} → {new_name}")
-                else:
-                    # 完全新規物件
-                    cursor.execute("""
-                        INSERT INTO atbb_properties (
-                            property_key, name, room_number,
-                            rent, management_fee, deposit, key_money,
-                            layout, area, floors, address,
-                            build_year, transport, structure,
-                            transaction_type, management_company,
-                            publish_date, property_id, prefecture,
-                            status, first_seen, last_seen
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        key, prop.get('名前', ''), prop.get('号室', ''),
-                        prop.get('賃料', ''), prop.get('管理費等', ''),
-                        prop.get('敷金', ''), prop.get('礼金', ''),
-                        prop.get('間取り', ''), prop.get('専有面積', ''),
-                        prop.get('階建/階', ''), prop.get('所在地', ''),
-                        prop.get('築年月', ''), prop.get('交通', ''),
-                        prop.get('建物構造', ''), prop.get('取引態様', ''),
-                        prop.get('管理会社情報', ''), prop.get('公開日', ''),
-                        prop.get('物件番号', ''), prefecture,
-                        '募集中', now, now,
-                    ))
-                    inserted += 1
+                # 新規物件 → そのままINSERT
+                cursor.execute("""
+                    INSERT INTO atbb_properties (
+                        property_key, name, room_number,
+                        rent, management_fee, deposit, key_money,
+                        layout, area, floors, address,
+                        build_year, transport, structure,
+                        transaction_type, management_company,
+                        publish_date, property_id, prefecture,
+                        status, first_seen, last_seen
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    key, prop.get('名前', ''), prop.get('号室', ''),
+                    prop.get('賃料', ''), prop.get('管理費等', ''),
+                    prop.get('敷金', ''), prop.get('礼金', ''),
+                    prop.get('間取り', ''), prop.get('専有面積', ''),
+                    prop.get('階建/階', ''), prop.get('所在地', ''),
+                    prop.get('築年月', ''), prop.get('交通', ''),
+                    prop.get('建物構造', ''), prop.get('取引態様', ''),
+                    prop.get('管理会社情報', ''), prop.get('公開日', ''),
+                    prop.get('物件番号', ''), prefecture,
+                    '募集中', now, now,
+                ))
+                inserted += 1
 
         conn.commit()
     finally:
         conn.close()
 
-    print(f"   📊 DB更新: 新規{inserted} / 更新{updated} / 名前変更{name_changed}")
+    print(f"   📊 DB更新: 新規{inserted} / 更新{updated}")
     return current_keys
 
 
@@ -1524,10 +1492,7 @@ try:
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
         print(f"🆕 タブ切替: {driver.current_url}")
-        try:
-            WebDriverWait(driver, 10).until(lambda d: d.execute_script("return document.readyState") == "complete")
-        except:
-            pass
+        wait_for_page_ready(driver)
     else:
         print("  → 同じタブで続行します")
         human_delay(0.5, 1.0)
@@ -1610,13 +1575,8 @@ try:
         wait_and_accept_alert()
         human_delay(1.0, 1.5)
 
-        # ページ読み込み完了を待つ
-        try:
-            WebDriverWait(driver, 15).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-        except:
-            pass
+        # ページ読み込み完了を待つ（スタック時は自動リロード）
+        wait_for_page_ready(driver)
         wait_and_accept_alert()
 
         # 市区郡全選択
@@ -1676,9 +1636,7 @@ try:
                 count_select.select_by_value("100")
                 print("🔢 表示件数を100件に変更（セッション中維持）")
                 # onchangeでsubmitPagingActionが発火→ページリロードを待機
-                WebDriverWait(driver, 20).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
+                wait_for_page_ready(driver)
                 human_delay(0.5, 1.0)
                 wait_and_accept_alert()
                 display_count_changed = True
@@ -1694,13 +1652,8 @@ try:
         while not interrupted:
             print(f"📄 {prefecture_name} - {page}ページ目を取得中...")
 
-            # ページの読み込み完了を待機（固定waitではなくWebDriverWait）
-            try:
-                WebDriverWait(driver, 10).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-            except:
-                pass
+            # ページの読み込み完了を待機（スタック時は自動リロード）
+            wait_for_page_ready(driver)
             human_delay()
 
             # === 物件カード検出＆抽出（Selenium直接方式） ===
@@ -1729,9 +1682,7 @@ try:
                     # ページリロード
                     try:
                         driver.refresh()
-                        WebDriverWait(driver, 15).until(
-                            lambda d: d.execute_script("return document.readyState") == "complete"
-                        )
+                        wait_for_page_ready(driver)
                         human_delay(1.0, 2.0)
                     except:
                         pass
