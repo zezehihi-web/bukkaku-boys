@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>空確くん テストページ</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', 'Yu Gothic UI', sans-serif; background: #f0f2f5; color: #1a1a2e; min-height: 100vh; }
+
+  .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 20px; font-weight: 700; }
+  .header .badge { background: rgba(255,255,255,0.25); font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+
+  .container { max-width: 900px; margin: 0 auto; padding: 24px 16px; }
+
+  /* --- Health --- */
+  .health { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; padding: 10px 16px; background: #fff; border-radius: 8px; font-size: 13px; }
+  .health-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .health-ok { background: #22c55e; }
+  .health-ng { background: #ef4444; }
+
+  /* --- Input --- */
+  .input-card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .input-card label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+  .input-row { display: flex; gap: 8px; }
+  .input-row input { flex: 1; padding: 10px 14px; border: 2px solid #e2e8f0; border-radius: 8px; font-size: 14px; outline: none; transition: border-color 0.2s; }
+  .input-row input:focus { border-color: #667eea; }
+  .input-row button { padding: 10px 24px; background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+  .input-row button:hover { opacity: 0.9; }
+  .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .input-hint { font-size: 12px; color: #94a3b8; margin-top: 6px; }
+
+  /* --- Steps --- */
+  .steps-card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); display: none; }
+  .steps-card.active { display: block; }
+  .steps-title { font-size: 15px; font-weight: 700; margin-bottom: 16px; }
+  .steps { display: flex; align-items: center; gap: 0; margin-bottom: 16px; }
+  .step { display: flex; align-items: center; gap: 0; }
+  .step-circle { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; border: 2px solid #cbd5e1; color: #94a3b8; background: #fff; position: relative; }
+  .step-circle.done { background: #22c55e; border-color: #22c55e; color: #fff; }
+  .step-circle.active { border-color: #667eea; color: #667eea; animation: pulse 1.5s ease infinite; }
+  .step-circle.error { background: #ef4444; border-color: #ef4444; color: #fff; }
+  .step-label { font-size: 11px; color: #64748b; position: absolute; top: 42px; white-space: nowrap; left: 50%; transform: translateX(-50%); }
+  .step-line { width: 60px; height: 2px; background: #e2e8f0; }
+  .step-line.done { background: #22c55e; }
+
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 0 rgba(102,126,234,0.4); } 50% { box-shadow: 0 0 0 8px rgba(102,126,234,0); } }
+
+  /* --- Property Info --- */
+  .info-grid { display: grid; grid-template-columns: 100px 1fr; gap: 4px 12px; font-size: 13px; margin-top: 16px; padding-top: 16px; border-top: 1px solid #f1f5f9; }
+  .info-label { color: #64748b; font-weight: 600; }
+  .info-value { color: #1e293b; word-break: break-all; }
+
+  /* --- Platform Selector --- */
+  .platform-card { background: #fffbeb; border: 2px solid #fbbf24; border-radius: 12px; padding: 20px; margin-bottom: 24px; display: none; }
+  .platform-card.active { display: block; }
+  .platform-card h3 { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+  .platform-card p { font-size: 13px; color: #92400e; margin-bottom: 12px; }
+  .platform-buttons { display: flex; gap: 8px; flex-wrap: wrap; }
+  .platform-btn { padding: 10px 20px; border: 2px solid #667eea; background: #fff; color: #667eea; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+  .platform-btn:hover { background: #667eea; color: #fff; }
+  .remember-row { margin-top: 10px; font-size: 12px; display: flex; align-items: center; gap: 6px; }
+
+  /* --- Result --- */
+  .result-card { border-radius: 12px; padding: 24px; margin-bottom: 24px; text-align: center; display: none; }
+  .result-card.active { display: block; }
+  .result-card.available { background: #f0fdf4; border: 2px solid #22c55e; }
+  .result-card.applied { background: #fefce8; border: 2px solid #eab308; }
+  .result-card.closed { background: #fef2f2; border: 2px solid #ef4444; }
+  .result-card.not-found { background: #f8fafc; border: 2px solid #94a3b8; }
+  .result-card.err { background: #fef2f2; border: 2px solid #ef4444; }
+  .result-big { font-size: 28px; font-weight: 800; margin-bottom: 4px; }
+  .result-sub { font-size: 13px; color: #64748b; }
+
+  /* --- Log --- */
+  .log-card { background: #1e293b; border-radius: 12px; padding: 16px; margin-bottom: 24px; }
+  .log-card h3 { color: #94a3b8; font-size: 12px; font-weight: 600; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+  .log-area { font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px; color: #e2e8f0; max-height: 300px; overflow-y: auto; line-height: 1.6; }
+  .log-area .time { color: #64748b; }
+  .log-area .info { color: #38bdf8; }
+  .log-area .ok { color: #4ade80; }
+  .log-area .warn { color: #fbbf24; }
+  .log-area .err { color: #f87171; }
+
+  /* --- History --- */
+  .history-card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .history-card h3 { font-size: 15px; font-weight: 700; margin-bottom: 12px; }
+  .history-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .history-table th { text-align: left; padding: 8px; color: #64748b; border-bottom: 2px solid #e2e8f0; font-size: 12px; }
+  .history-table td { padding: 8px; border-bottom: 1px solid #f1f5f9; }
+  .history-table tr:hover { background: #f8fafc; }
+  .badge-sm { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-green { background: #dcfce7; color: #166534; }
+  .badge-yellow { background: #fef9c3; color: #854d0e; }
+  .badge-red { background: #fee2e2; color: #991b1b; }
+  .badge-gray { background: #f1f5f9; color: #475569; }
+  .badge-blue { background: #dbeafe; color: #1e40af; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>空確くん</h1>
+  <span class="badge">TEST PAGE</span>
+</div>
+
+<div class="container">
+
+  <!-- Health Check -->
+  <div class="health" id="health">
+    <div class="health-dot health-ng" id="healthDot"></div>
+    <span id="healthText">バックエンド接続確認中...</span>
+  </div>
+
+  <!-- URL Input -->
+  <div class="input-card">
+    <label>SUUMO / HOMES の物件URLを入力</label>
+    <div class="input-row">
+      <input type="text" id="urlInput" placeholder="https://suumo.jp/chintai/bc_... or https://www.homes.co.jp/chintai/b-..." />
+      <button id="checkBtn" onclick="startCheck()" disabled>確認する</button>
+    </div>
+    <div class="input-hint">SUUMOまたはHOMESの物件詳細ページURLを貼り付けてください</div>
+  </div>
+
+  <!-- Step Progress -->
+  <div class="steps-card" id="stepsCard">
+    <div class="steps-title" id="stepsTitle">処理中...</div>
+    <div class="steps">
+      <div class="step">
+        <div class="step-circle" id="s1">1<span class="step-label">URL解析</span></div>
+      </div>
+      <div class="step-line" id="l1"></div>
+      <div class="step">
+        <div class="step-circle" id="s2">2<span class="step-label">ATBB照合</span></div>
+      </div>
+      <div class="step-line" id="l2"></div>
+      <div class="step">
+        <div class="step-circle" id="s3">3<span class="step-label">空室確認</span></div>
+      </div>
+      <div class="step-line" id="l3"></div>
+      <div class="step">
+        <div class="step-circle" id="s4">4<span class="step-label">完了</span></div>
+      </div>
+    </div>
+
+    <!-- Property Info (shown during/after processing) -->
+    <div class="info-grid" id="infoGrid" style="display:none">
+      <span class="info-label">物件名</span><span class="info-value" id="infoName">-</span>
+      <span class="info-label">住所</span><span class="info-value" id="infoAddr">-</span>
+      <span class="info-label">賃料</span><span class="info-value" id="infoRent">-</span>
+      <span class="info-label">面積</span><span class="info-value" id="infoArea">-</span>
+      <span class="info-label">間取り</span><span class="info-value" id="infoLayout">-</span>
+      <span class="info-label">管理会社</span><span class="info-value" id="infoCompany">-</span>
+      <span class="info-label">ATBB照合</span><span class="info-value" id="infoAtbb">-</span>
+      <span class="info-label">ポータル</span><span class="info-value" id="infoPortal">-</span>
+    </div>
+  </div>
+
+  <!-- Platform Selection -->
+  <div class="platform-card" id="platformCard">
+    <h3>プラットフォームを選択してください</h3>
+    <p id="platformCompany"></p>
+    <div class="platform-buttons">
+      <button class="platform-btn" onclick="selectPlatform('itanji')">イタンジBB</button>
+      <button class="platform-btn" onclick="selectPlatform('es_square')">いい生活スクエア</button>
+    </div>
+    <div class="remember-row">
+      <input type="checkbox" id="rememberCheck" checked />
+      <label for="rememberCheck">この管理会社のプラットフォームを記憶する</label>
+    </div>
+  </div>
+
+  <!-- Result -->
+  <div class="result-card" id="resultCard">
+    <div class="result-big" id="resultText"></div>
+    <div class="result-sub" id="resultSub"></div>
+  </div>
+
+  <!-- Log -->
+  <div class="log-card">
+    <h3>Activity Log</h3>
+    <div class="log-area" id="logArea"></div>
+  </div>
+
+  <!-- History -->
+  <div class="history-card">
+    <h3>確認履歴</h3>
+    <table class="history-table">
+      <thead><tr><th>#</th><th>物件名</th><th>ステータス</th><th>結果</th><th>ポータル</th><th>日時</th></tr></thead>
+      <tbody id="historyBody"><tr><td colspan="6" style="color:#94a3b8;text-align:center;">データなし</td></tr></tbody>
+    </table>
+  </div>
+
+</div>
+
+<script>
+const API = 'http://localhost:8001/api';
+let currentCheckId = null;
+let pollTimer = null;
+
+// ===== Logging =====
+function log(msg, type = 'info') {
+  const area = document.getElementById('logArea');
+  const now = new Date().toLocaleTimeString('ja-JP');
+  area.innerHTML += `<div><span class="time">[${now}]</span> <span class="${type}">${msg}</span></div>`;
+  area.scrollTop = area.scrollHeight;
+}
+
+// ===== Health Check =====
+async function checkHealth() {
+  try {
+    const res = await fetch(API + '/health');
+    if (res.ok) {
+      document.getElementById('healthDot').className = 'health-dot health-ok';
+      document.getElementById('healthText').textContent = 'バックエンド接続OK (localhost:8000)';
+      document.getElementById('checkBtn').disabled = false;
+      log('バックエンド接続成功', 'ok');
+      return true;
+    }
+  } catch(e) {}
+  document.getElementById('healthDot').className = 'health-dot health-ng';
+  document.getElementById('healthText').textContent = 'バックエンド未接続 - start_test.bat を実行してください';
+  document.getElementById('checkBtn').disabled = true;
+  log('バックエンド未接続: localhost:8000 に接続できません', 'err');
+  return false;
+}
+
+// ===== Start Check =====
+async function startCheck() {
+  const url = document.getElementById('urlInput').value.trim();
+  if (!url) { log('URLを入力してください', 'warn'); return; }
+  if (!url.includes('suumo.jp') && !url.includes('homes.co.jp')) {
+    log('SUUMOまたはHOMESのURLを入力してください', 'warn');
+    return;
+  }
+
+  // Reset UI
+  resetUI();
+  document.getElementById('stepsCard').classList.add('active');
+  document.getElementById('checkBtn').disabled = true;
+  log(`確認開始: ${url}`, 'info');
+
+  try {
+    const res = await fetch(API + '/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url })
+    });
+    const data = await res.json();
+    currentCheckId = data.id;
+    log(`チェックID: ${data.id} を作成しました`, 'ok');
+
+    // Start polling
+    pollStatus();
+  } catch (e) {
+    log(`リクエスト失敗: ${e.message}`, 'err');
+    document.getElementById('checkBtn').disabled = false;
+  }
+}
+
+// ===== Poll Status =====
+async function pollStatus() {
+  if (!currentCheckId) return;
+
+  try {
+    const res = await fetch(API + `/check/${currentCheckId}`);
+    const d = await res.json();
+    updateSteps(d);
+    updateInfo(d);
+
+    const terminal = ['done', 'not_found', 'error'];
+    if (terminal.includes(d.status)) {
+      showResult(d);
+      document.getElementById('checkBtn').disabled = false;
+      loadHistory();
+      return;
+    }
+    if (d.status === 'awaiting_platform') {
+      showPlatformSelector(d);
+    }
+
+    // Continue polling
+    pollTimer = setTimeout(pollStatus, 2000);
+  } catch (e) {
+    log(`ポーリング失敗: ${e.message}`, 'err');
+    pollTimer = setTimeout(pollStatus, 3000);
+  }
+}
+
+// ===== Update Step Circles =====
+function updateSteps(d) {
+  const s = d.status;
+  const circles = ['s1','s2','s3','s4'];
+  const lines = ['l1','l2','l3'];
+
+  // Reset all
+  circles.forEach(id => { document.getElementById(id).className = 'step-circle'; });
+  lines.forEach(id => { document.getElementById(id).className = 'step-line'; });
+
+  const statusMap = {
+    'pending':           { step: 0, title: 'リクエスト受付...' },
+    'parsing':           { step: 1, title: 'Step 1: URL解析中...' },
+    'matching':          { step: 2, title: 'Step 2: ATBB照合中...' },
+    'awaiting_platform': { step: 2, title: 'プラットフォーム選択待ち' },
+    'checking':          { step: 3, title: 'Step 3: 空室確認中...' },
+    'done':              { step: 4, title: '完了' },
+    'not_found':         { step: 4, title: '完了（該当なし）' },
+    'error':             { step: 0, title: 'エラー発生' },
+  };
+
+  const info = statusMap[s] || { step: 0, title: s };
+  document.getElementById('stepsTitle').textContent = info.title;
+
+  if (s === 'error') {
+    // Mark current as error
+    circles.forEach(id => { document.getElementById(id).className = 'step-circle error'; });
+    log(`エラー: ${d.error_message}`, 'err');
+    return;
+  }
+
+  for (let i = 0; i < 4; i++) {
+    const el = document.getElementById(circles[i]);
+    if (i + 1 < info.step) {
+      el.className = 'step-circle done';
+      el.innerHTML = '&#10003;<span class="step-label">' + el.querySelector('.step-label').textContent + '</span>';
+      if (lines[i]) document.getElementById(lines[i]).className = 'step-line done';
+    } else if (i + 1 === info.step) {
+      el.className = 'step-circle active';
+      if (s === 'done' || s === 'not_found') {
+        el.className = 'step-circle done';
+        el.innerHTML = '&#10003;<span class="step-label">' + el.querySelector('.step-label').textContent + '</span>';
+        if (lines[i]) document.getElementById(lines[i]).className = 'step-line done';
+      }
+    }
+  }
+
+  // Log status changes
+  const logMsg = {
+    'parsing': 'URL解析を開始しました',
+    'matching': 'ATBB照合を開始しました',
+    'checking': `空室確認を開始しました (${platformName(d.platform)})`,
+    'awaiting_platform': 'プラットフォーム選択を待っています...',
+  };
+  if (logMsg[s]) log(logMsg[s], 'info');
+}
+
+function platformName(p) {
+  return { itanji: 'イタンジBB', es_square: 'いい生活スクエア' }[p] || p || '未選択';
+}
+
+// ===== Update Property Info =====
+function updateInfo(d) {
+  if (d.property_name) {
+    document.getElementById('infoGrid').style.display = 'grid';
+    document.getElementById('infoName').textContent = d.property_name || '-';
+    document.getElementById('infoAddr').textContent = d.property_address || '-';
+    document.getElementById('infoRent').textContent = d.property_rent || '-';
+    document.getElementById('infoArea').textContent = d.property_area || '-';
+    document.getElementById('infoLayout').textContent = d.property_layout || '-';
+    document.getElementById('infoCompany').textContent = d.atbb_company || '-';
+    document.getElementById('infoAtbb').textContent = d.atbb_matched ? '合致' : (d.status === 'matching' ? '照合中...' : '未照合');
+    document.getElementById('infoPortal').textContent = d.portal_source ? d.portal_source.toUpperCase() : '-';
+  }
+}
+
+// ===== Platform Selector =====
+function showPlatformSelector(d) {
+  document.getElementById('platformCard').classList.add('active');
+  const company = d.atbb_company || '(不明)';
+  document.getElementById('platformCompany').textContent = `管理会社: ${company} のプラットフォームが不明です`;
+  log('プラットフォーム選択画面を表示', 'warn');
+}
+
+async function selectPlatform(platform) {
+  if (!currentCheckId) return;
+  const remember = document.getElementById('rememberCheck').checked;
+
+  log(`プラットフォーム選択: ${platformName(platform)} (記憶: ${remember ? 'Yes' : 'No'})`, 'info');
+
+  try {
+    await fetch(API + `/check/${currentCheckId}/platform`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform, remember })
+    });
+    document.getElementById('platformCard').classList.remove('active');
+    log('プラットフォーム送信完了、空室確認を再開します', 'ok');
+
+    // Resume polling
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = setTimeout(pollStatus, 1500);
+  } catch (e) {
+    log(`プラットフォーム選択失敗: ${e.message}`, 'err');
+  }
+}
+
+// ===== Show Result =====
+function showResult(d) {
+  const card = document.getElementById('resultCard');
+  card.classList.add('active');
+
+  const result = d.vacancy_result || d.status;
+  let cls = 'not-found';
+  if (result.includes('募集中')) cls = 'available';
+  else if (result.includes('申込')) cls = 'applied';
+  else if (result.includes('募集終了') || result.includes('成約')) cls = 'closed';
+  else if (d.status === 'error') cls = 'err';
+
+  card.className = `result-card active ${cls}`;
+  document.getElementById('resultText').textContent = d.status === 'error' ? 'エラー' : result;
+
+  let sub = '';
+  if (d.platform) sub += `確認先: ${platformName(d.platform)}`;
+  if (d.platform_auto) sub += ' (自動選択)';
+  if (d.error_message) sub = d.error_message;
+  document.getElementById('resultSub').textContent = sub;
+
+  log(`結果: ${result}${sub ? ' / ' + sub : ''}`, d.status === 'error' ? 'err' : 'ok');
+}
+
+// ===== Load History =====
+async function loadHistory() {
+  try {
+    const res = await fetch(API + '/checks?limit=20');
+    const list = await res.json();
+    const tbody = document.getElementById('historyBody');
+
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="color:#94a3b8;text-align:center;">データなし</td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = list.map(r => {
+      let statusBadge = '';
+      const st = r.status;
+      if (st === 'done') statusBadge = '<span class="badge-sm badge-green">完了</span>';
+      else if (st === 'error') statusBadge = '<span class="badge-sm badge-red">エラー</span>';
+      else if (st === 'not_found') statusBadge = '<span class="badge-sm badge-gray">該当なし</span>';
+      else statusBadge = `<span class="badge-sm badge-blue">${st}</span>`;
+
+      let resultBadge = '-';
+      const vr = r.vacancy_result;
+      if (vr) {
+        if (vr.includes('募集中')) resultBadge = '<span class="badge-sm badge-green">募集中</span>';
+        else if (vr.includes('申込')) resultBadge = '<span class="badge-sm badge-yellow">申込あり</span>';
+        else if (vr.includes('募集終了') || vr.includes('成約')) resultBadge = '<span class="badge-sm badge-red">募集終了</span>';
+        else resultBadge = `<span class="badge-sm badge-gray">${vr.substring(0,10)}</span>`;
+      }
+
+      const date = r.created_at ? new Date(r.created_at).toLocaleString('ja-JP', { month:'numeric', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '-';
+
+      return `<tr>
+        <td>${r.id}</td>
+        <td>${r.property_name || '(解析中)'}</td>
+        <td>${statusBadge}</td>
+        <td>${resultBadge}</td>
+        <td>${(r.portal_source || '-').toUpperCase()}</td>
+        <td>${date}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    // Silent fail
+  }
+}
+
+// ===== Reset =====
+function resetUI() {
+  currentCheckId = null;
+  if (pollTimer) clearTimeout(pollTimer);
+  document.getElementById('stepsCard').classList.remove('active');
+  document.getElementById('platformCard').classList.remove('active');
+  document.getElementById('resultCard').classList.remove('active');
+  document.getElementById('resultCard').className = 'result-card';
+  document.getElementById('infoGrid').style.display = 'none';
+
+  // Reset step circles
+  ['s1','s2','s3','s4'].forEach((id, i) => {
+    const el = document.getElementById(id);
+    el.className = 'step-circle';
+    const labels = ['URL解析','ATBB照合','空室確認','完了'];
+    el.innerHTML = `${i+1}<span class="step-label">${labels[i]}</span>`;
+  });
+  ['l1','l2','l3'].forEach(id => { document.getElementById(id).className = 'step-line'; });
+}
+
+// ===== Init =====
+(async function init() {
+  log('テストページを初期化中...', 'info');
+  const ok = await checkHealth();
+  if (ok) loadHistory();
+  // Retry health check every 10s if not connected
+  if (!ok) {
+    const retry = setInterval(async () => {
+      const ok = await checkHealth();
+      if (ok) { clearInterval(retry); loadHistory(); }
+    }, 10000);
+  }
+})();
+</script>
+
+</body>
+</html>

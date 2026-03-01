@@ -24,12 +24,36 @@ const STATUS_LABELS: Record<string, string> = {
   error: "エラー",
 };
 
+const STATUS_STYLES: Record<string, string> = {
+  pending: "text-gray-400",
+  parsing: "text-blue-500",
+  matching: "text-blue-500",
+  awaiting_platform: "text-orange-500",
+  checking: "text-blue-500",
+  done: "text-green-600",
+  not_found: "text-gray-500",
+  error: "text-red-500",
+};
+
 const RESULT_STYLES: Record<string, string> = {
   "募集中": "bg-green-100 text-green-800",
   "申込あり": "bg-yellow-100 text-yellow-800",
   "募集終了": "bg-red-100 text-red-800",
   "該当なし": "bg-gray-100 text-gray-800",
+  "確認不可": "bg-orange-100 text-orange-800",
+  "電話確認": "bg-blue-100 text-blue-800",
 };
+
+const getResultStyle = (result: string): string => {
+  if (RESULT_STYLES[result]) return RESULT_STYLES[result];
+  for (const [key, style] of Object.entries(RESULT_STYLES)) {
+    if (result.startsWith(key)) return style;
+  }
+  return "bg-gray-100 text-gray-700";
+};
+
+const isProcessing = (status: string) =>
+  ["pending", "parsing", "matching", "checking"].includes(status);
 
 export default function HomePage() {
   const [url, setUrl] = useState("");
@@ -53,10 +77,23 @@ export default function HomePage() {
     return () => clearInterval(interval);
   }, []);
 
+  const validateUrl = (input: string): string | null => {
+    const trimmed = input.trim();
+    if (!trimmed) return "URLを入力してください";
+    if (trimmed.includes("suumo.jp")) return null;
+    if (trimmed.includes("homes.co.jp")) return null;
+    return "SUUMOまたはHOMESのURLを入力してください";
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
-    if (!url.trim()) return;
+
+    const validationError = validateUrl(url);
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
 
     setSubmitting(true);
     try {
@@ -123,30 +160,43 @@ export default function HomePage() {
                 className="flex items-center justify-between p-3 rounded-lg hover:bg-gray-50 border border-gray-100 transition-colors"
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-xs text-gray-400 font-mono">
+                  <span className="text-xs text-gray-400 font-mono w-8 shrink-0">
                     #{item.id}
                   </span>
                   <span className="text-sm text-gray-900 truncate">
                     {item.property_name || "(解析中)"}
                   </span>
                   {item.portal_source && (
-                    <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-500 rounded">
+                    <span className="text-xs px-2 py-0.5 bg-gray-100 text-gray-500 rounded shrink-0">
                       {item.portal_source.toUpperCase()}
                     </span>
                   )}
                 </div>
-                <div className="flex items-center gap-2 shrink-0">
+                <div className="flex items-center gap-3 shrink-0">
+                  {item.created_at && (
+                    <span className="text-xs text-gray-300 hidden sm:inline">
+                      {item.created_at.split(" ")[0]}
+                    </span>
+                  )}
                   {item.vacancy_result ? (
                     <span
-                      className={`text-xs px-2 py-1 rounded-full font-medium ${
-                        RESULT_STYLES[item.vacancy_result] ||
-                        "bg-gray-100 text-gray-700"
+                      className={`text-xs px-2.5 py-1 rounded-full font-medium ${
+                        getResultStyle(item.vacancy_result)
                       }`}
                     >
-                      {item.vacancy_result}
+                      {item.vacancy_result.length > 10
+                        ? item.vacancy_result.slice(0, 10) + "..."
+                        : item.vacancy_result}
                     </span>
                   ) : (
-                    <span className="text-xs text-gray-400">
+                    <span
+                      className={`text-xs font-medium ${
+                        STATUS_STYLES[item.status] || "text-gray-400"
+                      }`}
+                    >
+                      {isProcessing(item.status) && (
+                        <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse mr-1.5 align-middle" />
+                      )}
                       {STATUS_LABELS[item.status] || item.status}
                     </span>
                   )}

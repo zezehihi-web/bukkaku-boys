@@ -11,7 +11,7 @@ async def lookup_platform(company_name: str, company_phone: str = "") -> str | N
         company_phone: 電話番号（オプション）
 
     Returns:
-        'itanji' / 'ierabu' / 'es_square' / None（未知の場合）
+        'itanji' / 'es_square' / None（未知の場合）
     """
     if not company_name:
         return None
@@ -46,6 +46,45 @@ async def lookup_platform(company_name: str, company_phone: str = "") -> str | N
         await db.close()
 
     return None
+
+
+async def is_phone_required(company_name: str) -> bool:
+    """管理会社が電話確認必要と学習済みか判定"""
+    if not company_name:
+        return False
+
+    db = await get_db()
+    try:
+        row = await db.execute(
+            """SELECT requires_phone FROM company_platform_knowledge
+               WHERE company_name = ? AND requires_phone = 1
+               LIMIT 1""",
+            (company_name,),
+        )
+        record = await row.fetchone()
+        return record is not None
+    finally:
+        await db.close()
+
+
+async def mark_phone_required(company_name: str, company_phone: str = ""):
+    """管理会社を「電話確認必要」としてマーク"""
+    if not company_name:
+        return
+
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO company_platform_knowledge (company_name, company_phone, platform, requires_phone)
+               VALUES (?, ?, 'phone', 1)
+               ON CONFLICT(company_name, platform) DO UPDATE SET
+                   requires_phone = 1,
+                   last_used_at = CURRENT_TIMESTAMP""",
+            (company_name, company_phone),
+        )
+        await db.commit()
+    finally:
+        await db.close()
 
 
 async def record_usage(company_name: str, platform: str, company_phone: str = ""):

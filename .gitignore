@@ -19,3 +19,17 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Claude Code state
+.claude/
+
+# Temp / Debug
+tmp/
+image.png
+
+# 参考フォルダ（本番クレデンシャルを含む）
+参考/
+
+# デバッグスクリプト（クレデンシャル含む可能性）
+debug_*.py
+fix_*.py

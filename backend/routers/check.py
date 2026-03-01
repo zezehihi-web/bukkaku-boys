@@ -1,15 +1,21 @@
 """空室確認APIルーター"""
 
-import asyncio
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
+from backend.config import ITANJI_EMAIL, ES_SQUARE_EMAIL
 from backend.database import get_db
 from backend.models import CheckRequest, CheckStatus, CheckListItem, PlatformSelection
 from backend.services.vacancy_checker import run_vacancy_check
 
 router = APIRouter(tags=["check"])
+
+
+def _start_background_check(check_id: int):
+    """バックグラウンドで空室確認を開始（Playwright専用スレッドに投入）"""
+    from backend.services.playwright_loop import submit_coro
+    submit_coro(run_vacancy_check(check_id))
 
 
 @router.post("/check", response_model=CheckStatus)
@@ -42,7 +48,7 @@ async def create_check(req: CheckRequest):
         await db.close()
 
     # バックグラウンドで空室確認処理を開始
-    asyncio.create_task(run_vacancy_check(row_id))
+    _start_background_check(row_id)
 
     return _row_to_status(record)
 
@@ -92,7 +98,7 @@ async def list_checks(limit: int = 50):
 @router.post("/check/{check_id}/platform")
 async def select_platform(check_id: int, sel: PlatformSelection):
     """ユーザーがプラットフォームを手動選択"""
-    if sel.platform not in ("itanji", "ierabu", "es_square"):
+    if sel.platform not in ("itanji", "es_square"):
         raise HTTPException(status_code=400, detail="無効なプラットフォーム")
 
     db = await get_db()
@@ -132,9 +138,18 @@ async def select_platform(check_id: int, sel: PlatformSelection):
         await db.close()
 
     # バックグラウンドで空室確認を再開
-    asyncio.create_task(run_vacancy_check(check_id))
+    _start_background_check(check_id)
 
     return {"status": "ok"}
+
+
+@router.get("/platforms/status")
+async def platform_status():
+    """各プラットフォームの認証設定状態"""
+    return {
+        "itanji": {"configured": bool(ITANJI_EMAIL), "label": "イタンジBB"},
+        "es_square": {"configured": bool(ES_SQUARE_EMAIL), "label": "いい生活スクエア"},
+    }
 
 
 def _row_to_status(row) -> CheckStatus:
@@ -147,6 +162,7 @@ def _row_to_status(row) -> CheckStatus:
         property_rent=row["property_rent"] or "",
         property_area=row["property_area"] or "",
         property_layout=row["property_layout"] or "",
+        property_build_year=row["property_build_year"] or "" if "property_build_year" in row.keys() else "",
         atbb_matched=bool(row["atbb_matched"]),
         atbb_company=row["atbb_company"] or "",
         platform=row["platform"] or "",

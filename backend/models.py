@@ -1,6 +1,5 @@
 """Pydantic データモデル定義"""
 
-from datetime import datetime
 from pydantic import BaseModel
 
 
@@ -13,7 +12,7 @@ class CheckRequest(BaseModel):
 
 class PlatformSelection(BaseModel):
     """プラットフォーム選択（ユーザー手動）"""
-    platform: str  # 'itanji' / 'ierabu' / 'es_square'
+    platform: str  # 'itanji' / 'es_square'
     remember: bool = True  # この選択を記憶する
 
 
@@ -22,6 +21,12 @@ class KnowledgeEntry(BaseModel):
     company_name: str
     company_phone: str = ""
     platform: str
+
+
+class PhoneTaskUpdate(BaseModel):
+    """電話確認タスク更新"""
+    status: str = "completed"  # 'completed' / 'cancelled'
+    note: str = ""
 
 
 # === レスポンス ===
@@ -36,6 +41,7 @@ class CheckStatus(BaseModel):
     property_rent: str
     property_area: str
     property_layout: str
+    property_build_year: str = ""
     atbb_matched: bool
     atbb_company: str
     platform: str
@@ -63,5 +69,21 @@ class KnowledgeItem(BaseModel):
     company_name: str
     company_phone: str
     platform: str
+    requires_phone: bool = False
     use_count: int
     last_used_at: str
+
+
+class PhoneTaskItem(BaseModel):
+    """電話確認タスク項目"""
+    id: int
+    check_request_id: int | None
+    company_name: str
+    company_phone: str
+    property_name: str
+    property_address: str
+    reason: str
+    status: str
+    note: str
+    created_at: str
+    completed_at: str | None

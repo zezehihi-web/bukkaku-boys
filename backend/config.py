@@ -13,18 +13,13 @@ DB_PATH = BASE_DIR / "backend" / "akikaku.db"
 ATBB_JSON_PATH = RESULTS_DIR / "properties_database_list.json"
 
 # ATBB認証
-ATBB_LOGIN_ID = os.getenv("ATBB_LOGIN_ID", "001089150164")
-ATBB_PASSWORD = os.getenv("ATBB_PASSWORD", "zezehihi893")
+ATBB_LOGIN_ID = os.getenv("ATBB_LOGIN_ID", "")
+ATBB_PASSWORD = os.getenv("ATBB_PASSWORD", "")
 
 # イタンジBB認証
 ITANJI_EMAIL = os.getenv("ITANJI_EMAIL", "")
 ITANJI_PASSWORD = os.getenv("ITANJI_PASSWORD", "")
 ITANJI_TOP_URL = "https://bukkakun.com/"
-
-# いえらぶBB認証
-IERABU_EMAIL = os.getenv("IERABU_EMAIL", "")
-IERABU_PASSWORD = os.getenv("IERABU_PASSWORD", "")
-IERABU_LOGIN_URL = "https://bb.ielove.jp/ielovebb/login/index"
 
 # いい生活スクエア認証
 ES_SQUARE_EMAIL = os.getenv("ES_SQUARE_EMAIL", "")
@@ -37,6 +32,8 @@ LINE_USER_ID = os.getenv("LINE_USER_ID", "")
 
 # Slack通知
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL = os.getenv("SLACK_CHANNEL", "")
 
 # API設定
 API_HOST = os.getenv("API_HOST", "0.0.0.0")

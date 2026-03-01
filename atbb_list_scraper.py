@@ -73,10 +73,17 @@ except ImportError:
         OCR_READER = None
 
 # ========= 設定 =========
-LOGIN_ID = "001089150164"
-PASSWORD = "zezehihi893"
+from dotenv import load_dotenv
+load_dotenv()
+
+LOGIN_ID = os.environ.get("ATBB_LOGIN_ID", "")
+PASSWORD = os.environ.get("ATBB_PASSWORD", "")
 
 TARGET_URL = "https://atbb.athome.co.jp/front-web/mainservlet/bfcm003s201"
+
+# テストモード: Trueにすると最初の10件のみ処理（動作確認用）
+TEST_MODE = False
+TEST_LIMIT = 10
 
 # 対象の都道府県 (ID, 県名)
 TARGET_PREFECTURES = [
@@ -105,7 +112,7 @@ if USE_UNDETECTED:
     chrome_options.add_argument("--disable-popup-blocking")
     chrome_options.add_argument("--disable-notifications")
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    driver = uc.Chrome(options=chrome_options, use_subprocess=True)
+    driver = uc.Chrome(options=chrome_options, use_subprocess=True, version_main=145)
 else:
     options = webdriver.ChromeOptions()
     options.add_argument("--start-maximized")
@@ -276,9 +283,35 @@ def save_data_to_files():
         print(f"      ⚠️ JSON保存エラー: {e}")
 
 # ============================================================================
+# 賃料テキストの正規化
+# ============================================================================
+def normalize_rent(rent_text):
+    """賃料テキストを正規化して円単位に変換"""
+    if not rent_text or rent_text == '要確認':
+        return ''
+    # スクリプト混入チェック
+    if 'Image(' in rent_text or 'function' in rent_text:
+        return ''
+    m = re.search(r'([\d,\.]+)\s*万円', rent_text)
+    if m:
+        try:
+            return f"{int(float(m.group(1).replace(',', '')) * 10000)}円"
+        except:
+            return rent_text
+    if re.search(r'[\d,]+円', rent_text):
+        return rent_text.replace(',', '')
+    # 数値のみの場合
+    m = re.search(r'[\d,\.]+', rent_text)
+    if m:
+        return rent_text
+    return ''
+
+
+# ============================================================================
 # 画像（賃料）からテキストを抽出・解読するロジック
 # ============================================================================
 def extract_rent_from_image(img_element):
+    """賃料画像からテキストを抽出（alt → CDNダウンロード+OCR → 要素スクリーンショット+OCR）"""
     rent_text = ''
     try:
         rent_text = img_element.get_attribute("alt") or img_element.get_attribute("title") or ''
@@ -286,6 +319,7 @@ def extract_rent_from_image(img_element):
         if not rent_text and OCR_AVAILABLE and OCR_READER is not None:
             img_src = img_element.get_attribute("src")
             if img_src:
+                # 方法1: CDN URLから直接ダウンロード
                 try:
                     img_response = requests.get(img_src, timeout=5)
                     if img_response.status_code == 200:
@@ -298,9 +332,26 @@ def extract_rent_from_image(img_element):
                                 if '万' not in rent_text and '円' not in rent_text:
                                     rent_text += '万円'
                                 break
-                except Exception as e:
+                except Exception:
                     pass
-    except:
+
+            # 方法2: Selenium要素スクリーンショットでOCR
+            if not rent_text:
+                try:
+                    img_png = img_element.screenshot_as_png
+                    if img_png:
+                        results = OCR_READER.readtext(img_png)
+                        for result in results:
+                            text = result[1]
+                            price_match = re.search(r'([\d,\.]+)\s*万?円?', text)
+                            if price_match:
+                                rent_text = price_match.group(0).strip()
+                                if '万' not in rent_text and '円' not in rent_text:
+                                    rent_text += '万円'
+                                break
+                except Exception:
+                    pass
+    except Exception:
         pass
 
     # 万円等の正規化
@@ -322,41 +373,166 @@ def extract_rent_from_image(img_element):
 # ============================================================================
 ENRICH_DETAILS = True  # 詳細ページで物件情報を補完するか
 
-def enrich_property_from_detail(drv, wait_obj, prop_data):
+# エラー統計カウンタ
+enrich_stats = {
+    'total': 0,
+    'success': 0,
+    'name_found': 0,
+    'addr_found': 0,
+    'rent_found': 0,
+    'company_found': 0,
+    'btn_not_found': 0,
+    'page_error': 0,
+    'first_error_saved': False,
+}
+
+def find_value_by_label(drv, label):
+    """汎用ラベル検索: 複数のHTML構造パターンを順に試して値テキストを返す
+
+    対応パターン:
+      - td.common-head / td.common-data （ATBBの標準テーブル）
+      - th / td
+      - dt / dd
+      - label / span
+      - 任意の要素 / following-sibling
+    """
+    patterns = [
+        # パターン1: td.common-head + td.common-data (ATBB標準)
+        (By.XPATH,
+         f"//td[contains(@class, 'common-head') and contains(text(), '{label}')]"
+         f"/following-sibling::td[contains(@class, 'common-data')]"),
+        # パターン2: td + following-sibling td (クラスなし)
+        (By.XPATH,
+         f"//td[contains(text(), '{label}')]/following-sibling::td[1]"),
+        # パターン3: th + td
+        (By.XPATH,
+         f"//th[contains(text(), '{label}')]/following-sibling::td[1]"),
+        # パターン4: dt + dd
+        (By.XPATH,
+         f"//dt[contains(text(), '{label}')]/following-sibling::dd[1]"),
+        # パターン5: label + span/div
+        (By.XPATH,
+         f"//label[contains(text(), '{label}')]/following-sibling::*[1]"),
+        # パターン6: 任意の要素 + following-sibling (最も広い)
+        (By.XPATH,
+         f"//*[contains(text(), '{label}')]/following-sibling::*[1]"),
+    ]
+
+    for by, selector in patterns:
+        try:
+            elem = drv.find_element(by, selector)
+            text = elem.text.strip()
+            if text:
+                return text
+        except:
+            continue
+    return ''
+
+
+def enrich_property_from_detail(drv, wait_obj, prop_data, button_index=None, btn_id=None):
     """詳細ページにアクセスして正式な物件名・住所・賃料・管理会社を取得
 
-    Args:
-        drv: WebDriverインスタンス
-        wait_obj: WebDriverWaitインスタンス
-        prop_data: 一覧から取得した物件データ dict
-
-    Returns:
-        enriched prop_data dict
+    実際のATBB詳細ページDOM構造に基づくセレクタ:
+      - 物件名: div.title-bar > p.name
+      - 所在地: td.common-head[text()='所在地'] + td.common-data（span含む）
+      - 賃料: td.common-data.payment 内の img alt/title → price_value_div → OCR
+      - 管理会社: 登録会員セクション内 span.large.bold + TEL正規表現
+      - 物件番号: span.bukkenno[data-bukkenno]
     """
+    global enrich_stats
+    enrich_stats['total'] += 1
+
     bukken_no = prop_data.get('物件番号', '')
-    if not bukken_no:
-        return prop_data
+    detail_tab_handle = None
+    original_handle = drv.current_window_handle
 
     try:
-        # 詳細ボタンをクリック（物件番号からonclickで特定）
+        # =============================================
+        # ボタン特定: ID方式を最優先（JS抽出で取得したbtnId）
+        # =============================================
         detail_btn = None
-        try:
-            detail_btn = drv.find_element(
-                By.CSS_SELECTOR, f"button[onclick*=\"'{bukken_no}'\"]"
-            )
-        except:
+
+        if btn_id:
+            # 方法0: JS抽出時に取得したボタンID（最も確実）
+            try:
+                detail_btn = drv.find_element(By.ID, btn_id)
+            except:
+                pass
+
+        if detail_btn is None and button_index is not None:
+            # 方法1: インデックスで直接取得
+            all_buttons = drv.find_elements(By.CSS_SELECTOR, "button[name='shosai'], button[id^='shosai']")
+            if button_index < len(all_buttons):
+                detail_btn = all_buttons[button_index]
+
+        if detail_btn is None and bukken_no:
+            # 方法2: onclick属性で特定
+            try:
+                detail_btn = drv.find_element(
+                    By.CSS_SELECTOR, f"button[onclick*=\"'{bukken_no}'\"]"
+                )
+            except:
+                pass
+
+        if detail_btn is None and bukken_no:
+            # 方法3: ID で特定
             try:
                 detail_btn = drv.find_element(By.ID, f"shosai_{bukken_no}")
             except:
-                # ボタンが見つからない場合はスキップ
-                return prop_data
+                pass
 
-        # 現在のURLを記憶（戻る用）
-        list_url = drv.current_url
+        if detail_btn is None:
+            enrich_stats['btn_not_found'] += 1
+            print(f"      ⚠️ 詳細ボタンが見つかりません (idx={button_index}, 物件番号={bukken_no})")
+            return prop_data
 
-        drv.execute_script("arguments[0].click();", detail_btn)
+        # =============================================
+        # 新タブで詳細ページを開く（一覧ページを壊さない）
+        # =============================================
+        original_handles = set(drv.window_handles)
+
+        # formのtargetを_blankに設定してからボタンクリック
+        try:
+            drv.execute_script("""
+                var forms = document.querySelectorAll('form');
+                for (var i = 0; i < forms.length; i++) {
+                    forms[i].setAttribute('target', '_blank');
+                }
+            """)
+            drv.execute_script("arguments[0].click();", detail_btn)
+        except Exception:
+            drv.execute_script("arguments[0].click();", detail_btn)
+
         wait_and_accept_alert()
-        human_delay(1.5, 2.5)
+        human_delay(2.0, 3.0)
+
+        # 新タブが開いたか確認（最大5秒待つ）
+        new_tab_found = False
+        for _ in range(10):
+            new_handles = set(drv.window_handles) - original_handles
+            if new_handles:
+                detail_tab_handle = new_handles.pop()
+                drv.switch_to.window(detail_tab_handle)
+                new_tab_found = True
+                break
+            time.sleep(0.5)
+
+        if not new_tab_found:
+            detail_tab_handle = None
+
+        # formのtargetを元に戻す
+        if detail_tab_handle:
+            try:
+                drv.switch_to.window(original_handle)
+                drv.execute_script("""
+                    var forms = document.querySelectorAll('form');
+                    for (var i = 0; i < forms.length; i++) {
+                        forms[i].removeAttribute('target');
+                    }
+                """)
+                drv.switch_to.window(detail_tab_handle)
+            except:
+                drv.switch_to.window(detail_tab_handle)
 
         # 詳細ページの読み込み待ち
         try:
@@ -365,161 +541,291 @@ def enrich_property_from_detail(drv, wait_obj, prop_data):
             )
         except:
             pass
+        human_delay(0.5, 1.0)
 
-        # --- 物件名の取得 ---
-        try:
-            name_elem = drv.find_element(By.CSS_SELECTOR, ".title-bar .name")
-            full_name = name_elem.text.strip()
-            if full_name and full_name != 'AT' and len(full_name) > 1:
-                # 号室を分離
-                if '/' in full_name:
-                    parts = full_name.rsplit('/', 1)
-                    prop_data['名前'] = parts[0].strip()
-                    prop_data['号室'] = parts[1].strip()
-                else:
-                    prop_data['名前'] = full_name
-        except:
-            try:
-                name_elem = drv.find_element(By.XPATH, "//p[contains(@class, 'name')]")
-                full_name = name_elem.text.strip()
-                if full_name and full_name != 'AT' and len(full_name) > 1:
+        # =============================================
+        # 詳細ページに遷移したか確認（一覧ページのままなら中断）
+        # =============================================
+        is_detail_page = drv.execute_script("""
+            // 詳細ページには div.title-bar があり、一覧ページには .property_card が複数ある
+            var titleBar = document.querySelector('div.title-bar p.name, .title-bar .name');
+            var cards = document.querySelectorAll('.property_card');
+            return titleBar !== null || cards.length <= 1;
+        """)
+        if not is_detail_page:
+            print(f"      ⚠️ 詳細ページへの遷移失敗（一覧ページのまま）- スキップ")
+            enrich_stats['page_error'] += 1
+            return prop_data
+
+        # =============================================
+        # JavaScript一括取得（1回のJS実行で全データ取得）
+        # =============================================
+        detail_data = drv.execute_script("""
+            var result = {};
+
+            // 物件名: div.title-bar > p.name
+            var nameElem = document.querySelector('div.title-bar p.name, .title-bar .name');
+            result.name = nameElem ? nameElem.textContent.trim() : '';
+
+            // 所在地: td.common-head + td.common-data
+            var heads = document.querySelectorAll('td.common-head');
+            for (var i = 0; i < heads.length; i++) {
+                var headText = heads[i].textContent.trim();
+
+                if (headText === '所在地' && !result.addr) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) {
+                        var clone = dataCell.cloneNode(true);
+                        // 地図ボタンやスクリプトを除去
+                        var removes = clone.querySelectorAll('.map, script, button, [onclick*="Chizu"]');
+                        for (var r = 0; r < removes.length; r++) removes[r].remove();
+                        result.addr = clone.textContent.trim().replace(/\\s+/g, '');
+                    }
+                }
+
+                // 管理費等
+                if (headText.indexOf('管理費') >= 0 && !result.kanrihi) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.kanrihi = dataCell.textContent.trim();
+                }
+
+                // 間取り
+                if (headText === '間取り' && !result.madori) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.madori = dataCell.textContent.trim();
+                }
+
+                // 交通
+                if (headText === '交通' && !result.kotsu) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.kotsu = dataCell.textContent.trim();
+                }
+
+                // 築年月
+                if (headText === '築年月' && !result.chiku) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.chiku = dataCell.textContent.trim();
+                }
+
+                // 建物構造
+                if (headText === '建物構造' && !result.kouzou) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.kouzou = dataCell.textContent.trim();
+                }
+
+                // 専有面積
+                if (headText === '専有面積' && !result.menseki) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.menseki = dataCell.textContent.trim();
+                }
+
+                // 階建/階
+                if (headText === '階建/階' && !result.kai) {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.kai = dataCell.textContent.trim();
+                }
+            }
+
+            // 賃料: price_value_div → price_txt_div → img alt/title
+            result.rent = '';
+            // 方法A: price_value_div のテキスト（JSで動的に設定された場合）
+            var priceValueDivs = document.querySelectorAll('[id^="price_value_div"]');
+            for (var i = 0; i < priceValueDivs.length; i++) {
+                var t = priceValueDivs[i].textContent.trim();
+                if (t) { result.rent = t; break; }
+            }
+            // 方法B: price_txt_div のテキスト
+            if (!result.rent) {
+                var priceTxtDivs = document.querySelectorAll('[id^="price_txt_div"]');
+                for (var i = 0; i < priceTxtDivs.length; i++) {
+                    var t = priceTxtDivs[i].textContent.trim();
+                    if (t) { result.rent = t; break; }
+                }
+            }
+            // 方法C: img[id^="price_img"] の alt/title
+            if (!result.rent) {
+                var priceImgs = document.querySelectorAll('img[id^="price_img"]');
+                for (var i = 0; i < priceImgs.length; i++) {
+                    var alt = priceImgs[i].alt || priceImgs[i].title || '';
+                    if (alt) { result.rent = alt; break; }
+                }
+            }
+
+            // 物件番号: span.bukkenno[data-bukkenno]
+            var bukkenElem = document.querySelector('span.bukkenno[data-bukkenno], [data-bukkenno]');
+            result.bukkenNo = bukkenElem ? bukkenElem.getAttribute('data-bukkenno') : '';
+
+            // 管理会社: 登録会員セクション span.large.bold
+            var companyElem = document.querySelector('span.large.bold');
+            result.company = companyElem ? companyElem.textContent.trim() : '';
+
+            // TEL: bodyテキストから正規表現
+            var bodyText = document.body.innerText || '';
+            var telMatch = bodyText.match(/TEL[：:]\\s*([\\d\\-]+)/);
+            result.tel = telMatch ? telMatch[1] : '';
+
+            // 取引態様
+            for (var i = 0; i < heads.length; i++) {
+                if (heads[i].textContent.trim() === '取引態様') {
+                    var dataCell = heads[i].nextElementSibling;
+                    if (dataCell) result.torihiki = dataCell.textContent.trim();
+                    break;
+                }
+            }
+
+            return result;
+        """)
+
+        if not detail_data:
+            detail_data = {}
+
+        # =============================================
+        # 物件名の反映
+        # =============================================
+        full_name = detail_data.get('name', '')
+        if full_name:
+            # フリガナを除去
+            full_name = re.sub(r'\([ァ-ヶー]+\)', '', full_name).strip()
+            if full_name and full_name not in ('AT', 'AT ', '') and len(full_name) > 1:
+                if not any(kw in full_name for kw in ['ログイン', 'メニュー', '検索', 'ATBB']):
+                    enrich_stats['name_found'] += 1
                     if '/' in full_name:
                         parts = full_name.rsplit('/', 1)
                         prop_data['名前'] = parts[0].strip()
-                        prop_data['号室'] = parts[1].strip()
+                        room = parts[1].strip()
+                        if room and room != '-':
+                            prop_data['号室'] = room
                     else:
                         prop_data['名前'] = full_name
-            except:
-                pass
 
-        # --- 所在地の取得 ---
-        try:
-            addr_elem = drv.find_element(
-                By.XPATH,
-                "//td[contains(@class, 'common-head') and contains(text(), '所在地')]"
-                "/following-sibling::td[contains(@class, 'common-data')]"
-            )
-            addr_text = addr_elem.text.strip()
-            addr_text = addr_text.split('地図を見る')[0].strip()
-            addr_text = addr_text.split('地図')[0].strip()
-            if addr_text and '▲' not in addr_text and len(addr_text) > 3:
-                prop_data['所在地'] = addr_text
-        except:
-            pass
+        # =============================================
+        # 所在地の反映
+        # =============================================
+        addr_text = detail_data.get('addr', '')
+        if addr_text and '▲' not in addr_text and len(addr_text) > 3:
+            prop_data['所在地'] = addr_text
+            enrich_stats['addr_found'] += 1
 
-        # --- 賃料の取得（画像のalt/title → テキスト → OCR） ---
-        try:
-            rent_head = drv.find_element(
-                By.XPATH, "//td[contains(@class, 'common-head') and text()='賃料']"
-            )
-            rent_cell = rent_head.find_element(
-                By.XPATH, "./following-sibling::td[contains(@class, 'payment')]"
-            )
-            rent_text = ''
-            # 方法1: 画像のalt/title
+        # =============================================
+        # 賃料の反映（画像テキスト → OCRフォールバック）
+        # =============================================
+        rent_text = detail_data.get('rent', '')
+
+        # OCRフォールバック（賃料がJSで取れなかった場合）
+        if not rent_text and OCR_AVAILABLE:
             try:
-                rent_img = rent_cell.find_element(By.CSS_SELECTOR, "img[id^='price_img']")
-                rent_text = rent_img.get_attribute("alt") or rent_img.get_attribute("title") or ''
+                rent_img = drv.find_element(By.CSS_SELECTOR, "td.common-data.payment img[id^='price_img'], img[id^='price_img']")
+                rent_text = extract_rent_from_image(rent_img)
             except:
                 pass
-            # 方法2: 非表示divのテキスト
-            if not rent_text:
-                try:
-                    price_div = rent_cell.find_element(By.CSS_SELECTOR, "div[id^='price_txt_div']")
-                    rent_text = price_div.text.strip()
-                except:
-                    pass
-            # 方法3: セルのテキスト
-            if not rent_text:
-                cell_text = rent_cell.text.strip()
-                if cell_text and '管理費' not in cell_text:
-                    rent_text = cell_text
-            # 方法4: OCR
-            if not rent_text and OCR_AVAILABLE:
-                try:
-                    rent_img = rent_cell.find_element(By.CSS_SELECTOR, "img[id^='price_img']")
-                    rent_text = extract_rent_from_image(rent_img)
-                except:
-                    pass
 
-            if rent_text and rent_text != '要確認':
-                # 正規化
-                m = re.search(r'([\d,\.]+)\s*万円', rent_text)
-                if m:
-                    try:
-                        prop_data['賃料'] = f"{int(float(m.group(1).replace(',', '')) * 10000):,}円"
-                    except:
-                        prop_data['賃料'] = rent_text
-                elif re.search(r'[\d,]+円', rent_text):
+        if rent_text and rent_text != '要確認':
+            enrich_stats['rent_found'] += 1
+            m = re.search(r'([\d,\.]+)\s*万円', rent_text)
+            if m:
+                try:
+                    prop_data['賃料'] = f"{int(float(m.group(1).replace(',', '')) * 10000):,}円"
+                except:
                     prop_data['賃料'] = rent_text
-        except:
-            pass
+            elif re.search(r'[\d,]+円', rent_text):
+                prop_data['賃料'] = rent_text
+            else:
+                prop_data['賃料'] = rent_text
 
-        # --- 管理会社情報の取得（より詳細に） ---
-        try:
-            page_text = drv.find_element(By.TAG_NAME, "body").text
-            # 「管理会社」ラベルの値を取得
-            company_name = ''
-            company_tel = ''
+        # =============================================
+        # 管理会社情報の反映
+        # =============================================
+        company_name = detail_data.get('company', '')
+        company_tel = detail_data.get('tel', '')
+        if company_name or company_tel:
+            prop_data['管理会社情報'] = f"{company_name} {company_tel}".strip()
+            enrich_stats['company_found'] += 1
 
-            # 方法1: テーブルから管理会社情報
-            try:
-                company_elem = drv.find_element(
-                    By.XPATH,
-                    "//td[contains(text(), '管理会社') or contains(text(), '元付会社')]"
-                    "/following-sibling::td"
-                )
-                company_name = company_elem.text.strip()
-            except:
-                pass
+        # =============================================
+        # その他フィールドの補完（一覧で取れなかった場合）
+        # =============================================
+        field_map = {
+            '間取り': 'madori', '交通': 'kotsu', '築年月': 'chiku',
+            '建物構造': 'kouzou', '専有面積': 'menseki', '階建/階': 'kai',
+            '管理費等': 'kanrihi', '取引態様': 'torihiki',
+        }
+        for jp_key, js_key in field_map.items():
+            val = detail_data.get(js_key, '')
+            if val and not prop_data.get(jp_key):
+                prop_data[jp_key] = val
 
-            # 方法2: テキストからTELを抽出
-            tel_match = re.search(r'TEL\s*[：:]\s*([\d\-]+)', page_text)
-            if tel_match:
-                company_tel = tel_match.group(1).strip()
+        # =============================================
+        # 物件番号の補完
+        # =============================================
+        bkn = detail_data.get('bukkenNo', '')
+        if bkn:
+            prop_data['物件番号'] = bkn
 
-            # 方法3: 既存のロジックで取引会社情報
-            if not company_name:
-                lines = page_text.split('\n')
-                for i, line in enumerate(lines):
-                    if 'TEL' in line and i > 0:
-                        company_name = lines[i-1].replace('★貸主', '').replace('★', '').replace('媒介', '').strip()
-                        break
-
-            if company_name or company_tel:
-                prop_data['管理会社情報'] = f"{company_name} {company_tel}".strip()
-        except:
-            pass
-
-        # --- 物件番号の補完 ---
-        try:
-            bukken_elem = drv.find_element(By.CSS_SELECTOR, ".bukkenno[data-bukkenno]")
-            prop_data['物件番号'] = bukken_elem.get_attribute("data-bukkenno") or bukken_no
-        except:
-            pass
-
-        # 一覧ページに戻る
-        drv.back()
-        human_delay(1.0, 2.0)
-        try:
-            WebDriverWait(drv, 10).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-        except:
-            pass
-        wait_and_accept_alert()
+        enrich_stats['success'] += 1
 
     except Exception as e:
-        print(f"      ⚠️ 詳細ページ取得エラー (物件番号: {bukken_no}): {e}")
-        # エラー時は一覧ページに戻る
+        enrich_stats['page_error'] += 1
+        print(f"      ⚠️ 詳細ページ取得エラー (idx={button_index}, 物件番号={bukken_no}): {e}")
+        if not enrich_stats['first_error_saved']:
+            try:
+                os.makedirs(RESULTS_DIR, exist_ok=True)
+                drv.save_screenshot(os.path.join(RESULTS_DIR, "enrich_error.png"))
+                with open(os.path.join(RESULTS_DIR, "enrich_error.html"), 'w', encoding='utf-8') as f:
+                    f.write(drv.page_source)
+                enrich_stats['first_error_saved'] = True
+                print(f"      📸 エラーのスクリーンショットを保存しました")
+            except:
+                pass
+
+    finally:
+        # =============================================
+        # 一覧ページに戻る（新タブ方式 or back()）
+        # =============================================
         try:
-            drv.back()
-            human_delay(1.0, 2.0)
-            wait_and_accept_alert()
-        except:
-            pass
+            if detail_tab_handle:
+                drv.close()
+                drv.switch_to.window(original_handle)
+            else:
+                drv.back()
+                human_delay(1.0, 2.0)
+                try:
+                    WebDriverWait(drv, 10).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                except:
+                    pass
+                wait_and_accept_alert()
+
+            # 一覧ページに戻れたか確認（.property_cardが複数あるはず）
+            try:
+                card_count = len(drv.find_elements(By.CSS_SELECTOR, ".property_card"))
+                if card_count < 2:
+                    print(f"      ⚠️ 一覧ページ復帰確認: property_card={card_count}件（期待値>1）")
+            except:
+                pass
+
+        except Exception as nav_e:
+            print(f"      ⚠️ 一覧復帰エラー: {nav_e}")
+            try:
+                drv.switch_to.window(original_handle)
+            except:
+                pass
+        human_delay(0.3, 0.6)
 
     return prop_data
+
+
+def print_enrich_stats():
+    """詳細取得の統計を表示"""
+    s = enrich_stats
+    print(f"\n   📊 詳細取得統計:")
+    print(f"      処理: {s['total']}件 | 成功: {s['success']}件")
+    print(f"      物件名取得: {s['name_found']}件 | 所在地取得: {s['addr_found']}件")
+    print(f"      賃料取得: {s['rent_found']}件 | 管理会社取得: {s['company_found']}件")
+    if s['btn_not_found'] > 0:
+        print(f"      ボタン未検出: {s['btn_not_found']}件")
+    if s['page_error'] > 0:
+        print(f"      ページエラー: {s['page_error']}件")
 
 # ============================================================================
 # JavaScript一括取得方式の物件抽出（超高速版）
@@ -527,62 +833,367 @@ def enrich_property_from_detail(drv, wait_obj, prop_data):
 # → Seleniumの個別通信（1件あたり5-6往復）を完全に排除
 # ============================================================================
 JS_EXTRACT_ALL = """
-var buttons = document.querySelectorAll("button[name='shosai'], button[id^='shosai']");
+var cards = document.querySelectorAll('.property_card');
 var results = [];
-for (var i = 0; i < buttons.length; i++) {
-    var btn = buttons[i];
-    var tr = btn.closest('tr');
-    if (!tr) tr = btn.parentElement;
-    if (!tr) continue;
+for (var i = 0; i < cards.length; i++) {
+    var card = cards[i];
+
+    // 物件名: .name から取得
+    var nameElem = card.querySelector('.name');
+    var name = nameElem ? nameElem.textContent.trim() : '';
+
+    // 物件種別: .type
+    var typeElem = card.querySelector('.type');
+    var type = typeElem ? typeElem.textContent.trim() : '';
+
+    // 公開日: .date
+    var dateElem = card.querySelector('.date');
+    var pubDate = dateElem ? dateElem.textContent.trim() : '';
+
+    // 所在地: .map-address のテキスト全体（地図リンク等を除外）
+    var addrElem = card.querySelector('.map-address');
+    var addr = '';
+    if (addrElem) {
+        var clone = addrElem.cloneNode(true);
+        var removes = clone.querySelectorAll('.map, [onclick*="Chizu"], .fa-location-dot, script');
+        for (var m = 0; m < removes.length; m++) removes[m].remove();
+        addr = clone.textContent.trim().replace(/\\s+/g, '');
+    }
+
+    // テーブルデータ: .info 内の th → td のペアを全取得
+    // ※物件番号はJS画像生成のためスキップ（data-bukkenno属性で取得）
+    var ths = card.querySelectorAll('.info th');
+    var tableData = {};
+    for (var j = 0; j < ths.length; j++) {
+        var th = ths[j];
+        var key = th.textContent.trim();
+        // 物件番号セルはJS関数が入るのでスキップ
+        if (key === '物件番号') continue;
+        var td = th.nextElementSibling;
+        if (td && td.tagName === 'TD') {
+            var val = td.textContent.trim();
+            // スクリプト混入チェック
+            if (val.indexOf('Image(') < 0 && val.indexOf('function') < 0) {
+                tableData[key] = val;
+            }
+        }
+    }
+
+    // 支払情報: .payment 内の dt/dd ペア（賃料は画像なのでスキップ）
+    var paymentDts = card.querySelectorAll('.payment dt');
+    var paymentData = {};
+    for (var j = 0; j < paymentDts.length; j++) {
+        var dt = paymentDts[j];
+        var dd = dt.nextElementSibling;
+        if (dd && dd.tagName === 'DD') {
+            var key = dt.textContent.trim();
+            if (key !== '賃料') {
+                var val = dd.textContent.trim();
+                if (val && val.indexOf('Image(') < 0) {
+                    paymentData[key] = val;
+                }
+            }
+        }
+    }
+
+    // 賃料: 画像（alt/title → price_value_div → price_txt_div）
+    // ※ATBBでは kakakuChinryoImage() で画像生成、alt属性は空の場合が多い
+    var rentText = '';
+    var priceImg = card.querySelector('img[id^="price_img"]');
+    if (priceImg) {
+        rentText = priceImg.alt || priceImg.title || '';
+    }
+    if (!rentText) {
+        var priceTxtDiv = card.querySelector('[id^="price_value_div"]');
+        if (priceTxtDiv) {
+            var t = priceTxtDiv.textContent.trim();
+            if (t && t.indexOf('Image(') < 0) rentText = t;
+        }
+    }
+    if (!rentText) {
+        var priceTxtOuter = card.querySelector('[id^="price_txt_div"]');
+        if (priceTxtOuter) {
+            var t = priceTxtOuter.textContent.trim();
+            if (t && t.indexOf('Image(') < 0) rentText = t;
+        }
+    }
+    // 賃料画像のインデックスを保存（後でOCR用）
+    var priceImgIdx = priceImg ? priceImg.id.replace('price_img_', '') : '';
+
+    // 物件番号: div.bkn_no_copy[data-bukkenno] 属性から取得
+    var bukkenNoElem = card.querySelector('.bkn_no_copy[data-bukkenno], [data-bukkenno]');
+    var bukkenNo = bukkenNoElem ? bukkenNoElem.getAttribute('data-bukkenno') : '';
+
+    // 管理会社: .company（テキストで取得可能）
+    var companyElem = card.querySelector('.company a, .company');
+    var company = companyElem ? companyElem.textContent.trim() : '';
+
+    // 電話番号: .tel（テキストで取得可能）
+    var telElem = card.querySelector('.tel a, .tel');
+    var tel = telElem ? telElem.textContent.trim().replace(/^TEL\\s*[:：]\\s*/, '') : '';
+
+    // 取引態様: .property_data 内の dt/dd から
+    var torihiki = '';
+    var dlDts = card.querySelectorAll('.property_data dt');
+    for (var j = 0; j < dlDts.length; j++) {
+        if (dlDts[j].textContent.trim() === '取引態様') {
+            var nextDD = dlDts[j].nextElementSibling;
+            if (nextDD) torihiki = nextDD.textContent.trim();
+        }
+    }
+
+    // 詳細ボタン（button#shosai_N）
+    var btn = card.querySelector('button[id^="shosai"]');
+    var btnId = btn ? btn.id : '';
+
     results.push({
-        text: tr.innerText || '',
-        onclick: btn.getAttribute('onclick') || '',
-        id: btn.id || '',
-        value: btn.value || ''
+        name: name,
+        type: type,
+        pubDate: pubDate,
+        addr: addr,
+        tableData: tableData,
+        paymentData: paymentData,
+        rentText: rentText,
+        priceImgIdx: priceImgIdx,
+        bukkenNo: bukkenNo,
+        company: company,
+        tel: tel,
+        torihiki: torihiki,
+        btnId: btnId
     });
 }
 return results;
 """
 
 def find_and_extract_properties(drv):
-    """JS一括実行で全物件データを高速抽出（ブラウザ通信1回のみ）"""
+    """JS一括実行で全物件データを高速抽出（property_card DOM構造から直接取得）"""
     properties = []
+
+    # ページ全体をスクロールして遅延レンダリングのカードを強制描画
+    try:
+        card_count = drv.execute_script("return document.querySelectorAll('.property_card').length;")
+        if card_count and card_count > 20:
+            # 100件表示の場合: 段階的スクロールで全カード描画
+            print(f"      [DEBUG] {card_count}件のカード検出 → 段階的スクロールで全描画を確保")
+            drv.execute_script("""
+                var cards = document.querySelectorAll('.property_card');
+                var step = Math.max(1, Math.floor(cards.length / 10));
+                for (var i = 0; i < cards.length; i += step) {
+                    cards[i].scrollIntoView({behavior: 'instant'});
+                }
+                // 最後のカードも確実に描画
+                cards[cards.length - 1].scrollIntoView({behavior: 'instant'});
+            """)
+            time.sleep(1.0)
+        else:
+            drv.execute_script("""
+                var cards = document.querySelectorAll('.property_card');
+                if (cards.length > 0) {
+                    cards[cards.length - 1].scrollIntoView();
+                }
+            """)
+            time.sleep(0.5)
+        drv.execute_script("window.scrollTo(0, 0);")
+        time.sleep(0.3)
+    except Exception:
+        pass
 
     try:
         raw_items = drv.execute_script(JS_EXTRACT_ALL)
     except Exception as e:
         print(f"      ⚠️ JS抽出エラー: {e}")
-        return properties
+        # フォールバック: 旧方式（テキスト抽出）を試行
+        return find_and_extract_properties_fallback(drv)
 
     if not raw_items:
         return properties
 
+    # === デバッグ: JS抽出結果の品質チェック ===
+    areas_from_js = set()
+    empty_table_count = 0
     for item in raw_items:
-        text = item.get('text', '')
-        if not text:
-            continue
+        td = item.get('tableData', {})
+        area = td.get('専有面積', '')
+        if area:
+            areas_from_js.add(area)
+        if not td.get('間取り') and not td.get('専有面積'):
+            empty_table_count += 1
+    print(f"      [DEBUG] JS抽出: {len(raw_items)}件, tableData空={empty_table_count}件, ユニーク面積={len(areas_from_js)}種")
+    if len(areas_from_js) == 1 and len(raw_items) > 5:
+        print(f"      ⚠️ [DEBUG] 全カードが同一面積! 値={areas_from_js.pop()} → DOM遅延レンダリングの可能性")
+    if empty_table_count > len(raw_items) * 0.5:
+        print(f"      ⚠️ [DEBUG] {empty_table_count}/{len(raw_items)}件のtableDataが空 → 全カード個別スクロールで再試行")
+        # 各カードを個別にスクロールして強制描画→再抽出
+        try:
+            drv.execute_script("""
+                var cards = document.querySelectorAll('.property_card');
+                for (var i = 0; i < cards.length; i++) {
+                    cards[i].scrollIntoView({behavior: 'instant'});
+                }
+                window.scrollTo(0, 0);
+            """)
+            time.sleep(1.5)
+            raw_items_retry = drv.execute_script(JS_EXTRACT_ALL)
+            if raw_items_retry:
+                # 再試行結果の品質チェック
+                retry_empty = sum(1 for item in raw_items_retry
+                                  if not item.get('tableData', {}).get('間取り')
+                                  and not item.get('tableData', {}).get('専有面積'))
+                print(f"      [DEBUG] 再試行結果: {len(raw_items_retry)}件, tableData空={retry_empty}件")
+                if retry_empty < empty_table_count:
+                    raw_items = raw_items_retry
+                    print(f"      ✅ 再試行でデータ改善 (空: {empty_table_count}→{retry_empty}件)")
+        except Exception as e:
+            print(f"      ⚠️ 再試行エラー: {e}")
 
-        data = extract_data_from_text(text)
+    # 最初3件のtableDataを出力
+    for idx, item in enumerate(raw_items[:3]):
+        td = item.get('tableData', {})
+        print(f"      [DEBUG] card[{idx}] tableData: 面積={td.get('専有面積','')}, 間取り={td.get('間取り','')}, 築年月={td.get('築年月','')}")
 
-        # 物件番号をボタン属性から補完
-        if not data['物件番号']:
-            onclick = item.get('onclick', '')
-            m = re.search(r"'(\d+)'", onclick)
-            if m:
-                data['物件番号'] = m.group(1)
-        if not data['物件番号']:
-            btn_id = item.get('id', '')
-            m = re.search(r'shosai[_-]?(\d+)', btn_id)
-            if m:
-                data['物件番号'] = m.group(1)
-        if not data['物件番号']:
-            btn_value = item.get('value', '')
-            if btn_value and btn_value.isdigit():
-                data['物件番号'] = btn_value
+    for item in raw_items:
+        data = {
+            '名前': '', '号室': '', '賃料': '', '管理費等': '', '礼金': '', '敷金': '',
+            '間取り': '', '専有面積': '', '階建/階': '', '所在地': '', '築年月': '',
+            '交通': '', '建物構造': '', '取引態様': '', '管理会社情報': '', '公開日': '',
+            '物件番号': '', '抽出日時': datetime.now().isoformat()
+        }
 
-        if data.get('名前'):
+        # --- 物件名と号室 ---
+        raw_name = item.get('name', '')
+        if raw_name:
+            # フリガナを除去: "物件名(フリガナ)" → "物件名"
+            raw_name = re.sub(r'\([ァ-ヶー]+\)', '', raw_name).strip()
+            # "/-" を除去（号室なしの場合）
+            raw_name = re.sub(r'/\s*-\s*$', '', raw_name).strip()
+            if '/' in raw_name:
+                parts = raw_name.rsplit('/', 1)
+                data['名前'] = parts[0].strip()
+                data['号室'] = parts[1].strip()
+            else:
+                data['名前'] = raw_name
+
+        # --- 所在地 ---
+        addr = item.get('addr', '')
+        if addr and addr != '▲' and len(addr) > 3:
+            data['所在地'] = addr
+
+        # --- テーブルデータ（間取り, 専有面積, 階建/階, 築年月, 交通, 建物構造） ---
+        table_data = item.get('tableData', {})
+        for key in ['間取り', '専有面積', '階建/階', '築年月', '交通', '建物構造']:
+            val = table_data.get(key, '')
+            if val:
+                data[key] = val.strip()
+
+        # 物件番号（data-bukkenno属性から取得 - テーブル内はJS関数のため不使用）
+        bukken_no = item.get('bukkenNo', '')
+        if bukken_no:
+            data['物件番号'] = bukken_no
+
+        # --- 支払情報（管理費等, 礼金, 敷金） ---
+        payment_data = item.get('paymentData', {})
+        if payment_data.get('管理費等'):
+            data['管理費等'] = payment_data['管理費等']
+        if payment_data.get('礼金'):
+            data['礼金'] = payment_data['礼金']
+        if payment_data.get('敷金'):
+            data['敷金'] = payment_data['敷金']
+
+        # --- 賃料（画像から取得した場合） ---
+        rent_text = item.get('rentText', '')
+        if rent_text:
+            rent_text = normalize_rent(rent_text)
+            if rent_text:
+                data['賃料'] = rent_text
+
+        # 賃料が取れなかった場合、OCRで取得を試みる（後で一括処理）
+        if not data['賃料']:
+            data['_price_img_idx'] = item.get('priceImgIdx', '')
+
+        # --- 管理会社情報 ---
+        company = item.get('company', '')
+        tel = item.get('tel', '')
+        if company or tel:
+            data['管理会社情報'] = f"{company} {tel}".strip()
+
+        # --- 取引態様 ---
+        torihiki = item.get('torihiki', '')
+        if torihiki:
+            data['取引態様'] = torihiki.strip()
+
+        # --- 公開日 ---
+        pub_date = item.get('pubDate', '')
+        if pub_date:
+            data['公開日'] = pub_date
+
+        # --- 詳細ボタンID（enrichment用） ---
+        btn_id = item.get('btnId', '')
+        if btn_id:
+            data['_btn_id'] = btn_id
+
+        # 物件名がある場合のみ追加
+        if data.get('名前') and data['名前'] not in ('AT', 'AT ', ''):
+            properties.append(data)
+        elif data.get('物件番号'):
+            # 名前がなくても物件番号があれば追加（詳細ページで補完）
+            if not data['名前']:
+                data['名前'] = '(詳細ページで取得)'
             properties.append(data)
 
+    # --- 賃料OCR一括処理 ---
+    # alt属性が空で賃料が取得できなかったカードの画像をOCRで処理
+    if OCR_AVAILABLE and OCR_READER is not None:
+        rent_missing = [p for p in properties if not p.get('賃料') and p.get('_price_img_idx')]
+        if rent_missing:
+            print(f"      🔍 賃料OCR: {len(rent_missing)}件の画像を処理中...")
+            ocr_success = 0
+            for prop in rent_missing:
+                idx = prop.get('_price_img_idx', '')
+                if not idx:
+                    continue
+                try:
+                    img_el = drv.find_element(By.ID, f"price_img_{idx}")
+                    rent_text = extract_rent_from_image(img_el)
+                    if rent_text and rent_text != '要確認':
+                        rent_normalized = normalize_rent(rent_text)
+                        if rent_normalized:
+                            prop['賃料'] = rent_normalized
+                            ocr_success += 1
+                        else:
+                            prop['賃料'] = rent_text
+                except Exception as e:
+                    pass
+            if rent_missing:
+                print(f"      ✅ 賃料OCR完了: {ocr_success}/{len(rent_missing)}件成功")
+
+    # 一時フィールドを削除（_btn_idはenrichment後にmainループで削除）
+    for prop in properties:
+        prop.pop('_price_img_idx', None)
+
+    return properties
+
+
+def find_and_extract_properties_fallback(drv):
+    """フォールバック: 旧方式のテキスト抽出（property_cardが見つからない場合）"""
+    properties = []
+    try:
+        buttons = drv.find_elements(By.CSS_SELECTOR, "button[name='shosai'], button[id^='shosai']")
+        for btn in buttons:
+            try:
+                parent = btn.find_element(By.XPATH, "./ancestor::div[contains(@class, 'property_card')]")
+            except:
+                parent = btn.find_element(By.XPATH, "./..")
+            text = parent.text if parent else ''
+            if text:
+                data = extract_data_from_text(text)
+                onclick = btn.get_attribute('onclick') or ''
+                m = re.search(r"'(\d+)'", onclick)
+                if m and not data['物件番号']:
+                    data['物件番号'] = m.group(1)
+                if data.get('名前'):
+                    properties.append(data)
+    except Exception as e:
+        print(f"      ⚠️ フォールバック抽出エラー: {e}")
     return properties
 
 def extract_data_from_text(text):
@@ -803,7 +1414,13 @@ try:
     # ---------------------------------------------------------
     display_count_changed = False  # 100件表示切替は1回だけ
 
-    for area_id, prefecture_name in TARGET_PREFECTURES:
+    # テストモード時は東京都のみ
+    prefectures_to_process = TARGET_PREFECTURES
+    if TEST_MODE:
+        prefectures_to_process = [TARGET_PREFECTURES[0]]
+        print(f"🧪 テストモード: {prefectures_to_process[0][1]}のみ、最大{TEST_LIMIT}件")
+
+    for area_id, prefecture_name in prefectures_to_process:
         if interrupted: break
 
         print(f"\n==============================================")
@@ -850,7 +1467,16 @@ try:
             continue
 
         wait_and_accept_alert()
-        human_delay(1.0, 2.0)
+        human_delay(2.0, 3.0)
+
+        # ページ読み込み完了を待つ
+        try:
+            WebDriverWait(driver, 15).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except:
+            pass
+        wait_and_accept_alert()
 
         # 市区郡全選択
         print("🏙️ 市区郡全選択")
@@ -940,6 +1566,15 @@ try:
             # === 物件カード検出＆抽出（Selenium直接方式） ===
             page_properties = find_and_extract_properties(driver)
 
+            # テストモード: 件数制限
+            if TEST_MODE and page_properties:
+                remaining = TEST_LIMIT - len(all_properties)
+                if remaining <= 0:
+                    print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました")
+                    break
+                if len(page_properties) > remaining:
+                    page_properties = page_properties[:remaining]
+
             if not page_properties:
                 # 検索結果なし？
                 if driver.find_elements(By.XPATH, "//*[contains(text(), '該当する物件がありません')]"):
@@ -952,7 +1587,9 @@ try:
             for prop in page_properties:
                 prop['抽出県'] = prefecture_name
 
-            # === 詳細ページで物件情報を補完（フェーズ0） ===
+            # === 詳細ページで物件情報を補完 ===
+            # 新DOM構造では一覧ページで大半のデータが取得可能
+            # 詳細ページは物件名・住所・賃料が欠損している場合のみ
             if ENRICH_DETAILS:
                 enriched_count = 0
                 for i, prop in enumerate(page_properties):
@@ -960,25 +1597,53 @@ try:
                         break
                     name = prop.get('名前', '')
                     addr = prop.get('所在地', '')
-                    # マスクされたデータ（AT、▲）の場合のみ詳細ページにアクセス
-                    needs_enrich = (
-                        (not name or name in ('AT', 'AT ', '') or len(name) <= 2) or
-                        (not addr or '▲' in addr or len(addr) <= 3) or
-                        (not prop.get('賃料') or prop.get('賃料') == '要確認') or
-                        (not prop.get('管理会社情報'))
-                    )
-                    if needs_enrich and prop.get('物件番号'):
-                        print(f"      🔍 詳細取得 ({i+1}/{len(page_properties)}): {name or '(名前なし)'}")
-                        prop = enrich_property_from_detail(driver, wait, prop)
+                    rent = prop.get('賃料', '')
+                    company = prop.get('管理会社情報', '')
+
+                    # 不足データの判定
+                    name_missing = (not name or name in ('AT', 'AT ', '', '(詳細ページで取得)') or len(name) <= 2)
+                    addr_missing = (not addr or '▲' in addr or len(addr) <= 3)
+                    rent_missing = (not rent or rent == '要確認')
+                    company_missing = (not company)
+
+                    # 1つでも不足があれば詳細ページにアクセス
+                    needs_enrich = name_missing or addr_missing or rent_missing or company_missing
+
+                    if needs_enrich:
+                        missing_fields = []
+                        if name_missing: missing_fields.append('名前')
+                        if addr_missing: missing_fields.append('住所')
+                        if rent_missing: missing_fields.append('賃料')
+                        if company_missing: missing_fields.append('管理会社')
+                        print(f"      🔍 詳細取得 ({i+1}/{len(page_properties)}): {name or '(名前なし)'} [不足: {', '.join(missing_fields)}]")
+                        prop_btn_id = prop.get('_btn_id', '')
+                        prop = enrich_property_from_detail(driver, wait, prop, button_index=i, btn_id=prop_btn_id)
                         page_properties[i] = prop
                         enriched_count += 1
                 if enriched_count > 0:
                     print(f"   ✅ {enriched_count}件の物件情報を詳細ページで補完しました")
+                    print_enrich_stats()
+
+            # === デバッグ: enrichment後のデータ品質チェック ===
+            areas_after = set(p.get('専有面積', '') for p in page_properties if p.get('専有面積'))
+            layouts_after = set(p.get('間取り', '') for p in page_properties if p.get('間取り'))
+            print(f"      [DEBUG] enrichment後: ユニーク面積={len(areas_after)}種, ユニーク間取り={len(layouts_after)}種 / {len(page_properties)}件")
+            if len(areas_after) == 1 and len(page_properties) > 5:
+                print(f"      ⚠️ [DEBUG] データ破損の疑い！全物件が同一面積: {areas_after.pop()}")
+
+            # _btn_id一時フィールドを削除
+            for prop in page_properties:
+                prop.pop('_btn_id', None)
 
             added_count = len(page_properties)
             all_properties.extend(page_properties)
 
             print(f"   => {added_count}件の物件データを追加 (総計: {len(all_properties)}件)")
+
+            # テストモード: 上限チェック
+            if TEST_MODE and len(all_properties) >= TEST_LIMIT:
+                print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました。ループ終了。")
+                break
 
             # 5ページごとに中間保存
             if page % 5 == 0:
@@ -1025,6 +1690,8 @@ try:
         save_data_to_files()
         print(f"\n🎉 完了！ データは {JSON_FILEPATH} に保存されました。")
         print(f"   最終物件数: {len(all_properties)}件")
+        if ENRICH_DETAILS:
+            print_enrich_stats()
     else:
         print("\n⚠️ 物件データが取得できませんでした")
 

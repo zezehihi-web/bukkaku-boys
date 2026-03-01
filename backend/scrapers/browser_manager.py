@@ -1,6 +1,6 @@
 """Playwright ブラウザ常駐管理
 
-各プラットフォーム（イタンジBB / いえらぶBB / いい生活スクエア）ごとに
+各プラットフォーム（イタンジBB / いい生活スクエア）ごとに
 独立したブラウザコンテキストを管理し、ログイン状態を維持する。
 """
 
@@ -33,7 +33,7 @@ async def get_page(platform: str) -> Page:
     """指定プラットフォーム用のページを取得（Cookie分離のため別コンテキスト）
 
     Args:
-        platform: 'itanji' / 'ierabu' / 'es_square'
+        platform: 'itanji' / 'es_square'
     """
     async with _lock:
         if platform in _pages:

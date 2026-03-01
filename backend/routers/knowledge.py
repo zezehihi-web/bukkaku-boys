@@ -36,7 +36,7 @@ async def list_knowledge():
 @router.post("/knowledge", response_model=KnowledgeItem)
 async def create_knowledge(entry: KnowledgeEntry):
     """ナレッジDB登録"""
-    if entry.platform not in ("itanji", "ierabu", "es_square"):
+    if entry.platform not in ("itanji", "es_square"):
         raise HTTPException(status_code=400, detail="無効なプラットフォーム")
 
     db = await get_db()
@@ -73,7 +73,7 @@ async def create_knowledge(entry: KnowledgeEntry):
 @router.put("/knowledge/{item_id}", response_model=KnowledgeItem)
 async def update_knowledge(item_id: int, entry: KnowledgeEntry):
     """ナレッジDB更新"""
-    if entry.platform not in ("itanji", "ierabu", "es_square"):
+    if entry.platform not in ("itanji", "es_square"):
         raise HTTPException(status_code=400, detail="無効なプラットフォーム")
 
     db = await get_db()

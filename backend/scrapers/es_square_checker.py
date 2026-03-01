@@ -1,27 +1,16 @@
 """いい生活スクエア 空室確認チェッカー
 
-既存のscrape_es_square.pyのlogin()ロジックを再利用。
-Auth0認証経由でログインし、物件名検索 → ステータス判定。
+物件名URLパラメータ(tatemono_name)で直接検索。
+判定ロジック: 該当物件の行に「申込あり」があれば申込あり、なければ募集中。
 """
 
+import urllib.parse
 from playwright.async_api import Page
 
 from backend.config import ES_SQUARE_EMAIL, ES_SQUARE_PASSWORD, ES_SQUARE_LOGIN_URL
 from backend.scrapers.browser_manager import get_page
 
-STATUS_KEYWORDS = {
-    "募集中": "募集中",
-    "空室": "募集中",
-    "空き": "募集中",
-    "申込あり": "申込あり",
-    "申込中": "申込あり",
-    "申し込みあり": "申込あり",
-    "紹介不可": "募集終了",
-    "募集終了": "募集終了",
-    "成約済": "募集終了",
-    "取り下げ": "募集終了",
-    "掲載終了": "募集終了",
-}
+SEARCH_BASE = "https://rent.es-square.net/bukken/chintai/search"
 
 
 async def _find_in_any_frame(page: Page, selectors: list[str]):
@@ -34,7 +23,6 @@ async def _find_in_any_frame(page: Page, selectors: list[str]):
                     return loc.first
             except Exception:
                 continue
-    # フォールバック: メインページのみ
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -48,15 +36,11 @@ async def _find_in_any_frame(page: Page, selectors: list[str]):
 async def _submit_auth_form(page: Page) -> bool:
     """Auth0フォームにメール/パスワードを入力して送信"""
     email_input = await _find_in_any_frame(page, [
-        "input#username",
-        "input[name='username']",
-        'input[type="email"]',
-        'input[name*="email"]',
+        "input#username", "input[name='username']",
+        'input[type="email"]', 'input[name*="email"]',
     ])
     password_input = await _find_in_any_frame(page, [
-        "input#password",
-        "input[name='password']",
-        'input[type="password"]',
+        "input#password", "input[name='password']", 'input[type="password"]',
     ])
     if not email_input or not password_input:
         return False
@@ -71,7 +55,6 @@ async def _submit_auth_form(page: Page) -> bool:
             'button:has-text("続ける")',
             "button[name='action'][value='default']",
             'button[type="submit"]',
-            'input[type="submit"]',
             'button:has-text("ログイン")',
         ])
         if submit:
@@ -81,21 +64,18 @@ async def _submit_auth_form(page: Page) -> bool:
     return True
 
 
-async def _login(page: Page) -> bool:
-    """いい生活スクエアにログイン（scrape_es_square.py login()準拠）"""
+async def login(page: Page) -> bool:
+    """いい生活スクエアにログイン（外部から呼び出し可能）"""
     if not ES_SQUARE_EMAIL or not ES_SQUARE_PASSWORD:
         raise ValueError("ES_SQUARE_EMAIL/ES_SQUARE_PASSWORD が未設定です")
 
     await page.goto(ES_SQUARE_LOGIN_URL, wait_until="load", timeout=90000)
     await page.wait_for_timeout(1200)
 
-    # Auth0フォームが表示されていればそのまま送信
     if not await _submit_auth_form(page):
-        # 「いい生活アカウントでログイン」ボタンを探す
         btn_selectors = [
             'button:has-text("いい生活アカウントでログイン")',
-            "button.css-rk6wt",
-            "div.css-4rmlxi button",
+            "button.css-rk6wt", "div.css-4rmlxi button",
             "button.MuiButton-contained",
         ]
         login_btn = None
@@ -113,7 +93,6 @@ async def _login(page: Page) -> bool:
         if not await _submit_auth_form(page):
             raise RuntimeError("いい生活スクエア: ログイン入力欄が見つかりません")
 
-    # ログイン完了待ち
     try:
         await page.wait_for_url("**/rent.es-square.net/**", timeout=40000)
     except Exception:
@@ -121,113 +100,106 @@ async def _login(page: Page) -> bool:
 
     if "rent.es-square.net" not in page.url:
         try:
-            await page.goto(
-                "https://rent.es-square.net/bukken/chintai/search?p=1&items_per_page=10",
-                wait_until="load",
-                timeout=30000,
-            )
+            await page.goto(SEARCH_BASE, wait_until="load", timeout=30000)
         except Exception:
             pass
 
-    if "rent.es-square.net" in page.url and "/bukken/" in page.url:
+    if "rent.es-square.net" in page.url and "login" not in page.url:
         return True
 
-    # リトライ
     await _submit_auth_form(page)
     await page.wait_for_timeout(5000)
     return "rent.es-square.net" in page.url
 
 
-async def _ensure_logged_in(page: Page) -> bool:
-    """ログイン状態確認"""
-    if "rent.es-square.net" in page.url and "login" not in page.url:
+async def is_logged_in(page: Page) -> bool:
+    """ログイン済みか確認"""
+    return "rent.es-square.net" in page.url and "login" not in page.url
+
+
+async def ensure_logged_in(page: Page) -> bool:
+    """ログイン状態を確認し、必要ならログイン"""
+    if await is_logged_in(page):
         return True
-    return await _login(page)
+    return await login(page)
 
 
-def _detect_status(text: str) -> str:
-    """テキストからステータス判定"""
-    for keyword, status in STATUS_KEYWORDS.items():
-        if keyword in text:
-            return status
-    return ""
-
-
-async def check_vacancy(property_name: str, room_number: str = "") -> str:
+async def check_vacancy(property_name: str, room_number: str = "", address: str = "") -> str:
     """いい生活スクエアで物件の空室状況を確認
 
+    物件名で検索し、該当物件の行に「申込あり」があれば申込あり、なければ募集中。
+
     Returns:
-        '募集中' / '申込あり' / '募集終了' / '該当なし'
+        '募集中' / '申込あり' / '該当なし'
     """
     page = await get_page("es_square")
-    await _ensure_logged_in(page)
+    await ensure_logged_in(page)
+    await page.wait_for_timeout(1000)
 
-    search_keyword = property_name
-    if room_number:
-        search_keyword = f"{property_name} {room_number}"
+    # 物件名で直接URL検索
+    params = urllib.parse.urlencode({
+        "tatemono_name": property_name,
+        "order": "saishu_koshin_time.desc",
+        "p": "1",
+        "items_per_page": "100",
+    })
+    search_url = f"{SEARCH_BASE}?{params}"
 
-    # 物件検索ページへ
-    search_url = f"https://rent.es-square.net/bukken/chintai/search?p=1&items_per_page=10"
     await page.goto(search_url, wait_until="load", timeout=30000)
-    await page.wait_for_timeout(2000)
+    await page.wait_for_timeout(4000)
 
-    # フリーワード検索
-    search_selectors = [
-        'input[placeholder*="検索"]',
-        'input[placeholder*="物件名"]',
-        'input[placeholder*="フリーワード"]',
-        'input[name*="keyword"]',
-        'input[name*="freeword"]',
-        'input[type="search"]',
-    ]
-
-    search_input = None
-    for sel in search_selectors:
-        loc = page.locator(sel)
-        if await loc.count() > 0:
-            search_input = loc.first
-            break
-
-    if not search_input:
-        raise RuntimeError("いい生活スクエア: 検索欄が見つかりません")
-
-    await search_input.fill(search_keyword)
-
-    # 検索ボタンをクリック
-    search_btn = None
-    for sel in ['button:has-text("検索")', 'input[value="検索"]', 'button[type="submit"]']:
-        loc = page.locator(sel)
-        if await loc.count() > 0:
-            search_btn = loc.first
-            break
-
-    if search_btn:
-        await search_btn.click()
-    else:
-        await page.keyboard.press("Enter")
-
-    await page.wait_for_timeout(3000)
-
+    # 件数確認: 「N件/ N件」のテキストを取得
     body_text = await page.inner_text("body")
 
-    if "該当する物件" in body_text and "ありません" in body_text:
-        return "該当なし"
-    if "0件" in body_text:
+    if "0 件" in body_text or "0件" in body_text:
         return "該当なし"
 
-    # 「申込あり」は募集終了扱い（既存ロジック準拠）
-    status = _detect_status(body_text)
-    if status:
-        return status
+    # 部屋番号がある場合、その部屋の行を探す
+    if room_number:
+        # 部屋番号が含まれる行を探して、その行に「申込あり」があるか確認
+        has_room = await page.evaluate("""(roomNum) => {
+            const body = document.body.innerText;
+            return body.includes(roomNum);
+        }""", room_number)
 
-    # 物件詳細をクリックして確認
-    property_links = page.locator("a[href*='bukken']")
-    if await property_links.count() > 0:
-        await property_links.first.click()
-        await page.wait_for_timeout(2000)
-        detail_text = await page.inner_text("body")
-        status = _detect_status(detail_text)
-        if status:
-            return status
+        if not has_room:
+            return "該当なし"
 
-    return "該当なし"
+        # その部屋の行に「申込あり」があるか
+        has_application = await page.evaluate("""(args) => {
+            const [propName, roomNum] = args;
+            // ページ内の全テキストノードを走査して、
+            // 部屋番号の近く（同じコンテナ内）に「申込あり」があるか確認
+            const images = document.querySelectorAll('img');
+            for (const img of images) {
+                let container = img.parentElement;
+                for (let i = 0; i < 10 && container; i++) {
+                    const text = container.innerText || '';
+                    if (text.includes(roomNum)) {
+                        return text.includes('申込あり') || text.includes('申込中');
+                    }
+                    container = container.parentElement;
+                }
+            }
+            // フォールバック: body全体で判定
+            const body = document.body.innerText;
+            if (body.includes(roomNum)) {
+                // 部屋番号の前後のテキストを確認
+                const idx = body.indexOf(roomNum);
+                const context = body.substring(Math.max(0, idx - 200), idx + 200);
+                return context.includes('申込あり') || context.includes('申込中');
+            }
+            return false;
+        }""", [property_name, room_number])
+
+        return "申込あり" if has_application else "募集中"
+
+    # 部屋番号なしの場合: 検索結果に物件があるか確認
+    has_property = property_name in body_text
+    if not has_property:
+        return "該当なし"
+
+    # 「申込あり」がなければ募集中
+    if "申込あり" in body_text or "申込中" in body_text:
+        return "申込あり"
+    return "募集中"

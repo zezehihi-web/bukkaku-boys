@@ -13,6 +13,7 @@ type CheckStatus = {
   property_rent: string;
   property_area: string;
   property_layout: string;
+  property_build_year: string;
   atbb_matched: boolean;
   atbb_company: string;
   platform: string;
@@ -44,7 +45,6 @@ const STEP_ORDER: Record<string, number> = {
 
 const PLATFORM_LABELS: Record<string, string> = {
   itanji: "イタンジBB",
-  ierabu: "いえらぶBB",
   es_square: "いい生活スクエア",
 };
 
@@ -53,6 +53,8 @@ const RESULT_STYLES: Record<string, { bg: string; text: string; icon: string }> 
   "申込あり": { bg: "bg-yellow-50", text: "text-yellow-700", icon: "bg-yellow-500" },
   "募集終了": { bg: "bg-red-50", text: "text-red-700", icon: "bg-red-500" },
   "該当なし": { bg: "bg-gray-50", text: "text-gray-700", icon: "bg-gray-500" },
+  "確認不可": { bg: "bg-orange-50", text: "text-orange-700", icon: "bg-orange-500" },
+  "電話確認": { bg: "bg-blue-50", text: "text-blue-700", icon: "bg-blue-500" },
 };
 
 export default function CheckDetailPage({
@@ -64,6 +66,17 @@ export default function CheckDetailPage({
   const [data, setData] = useState<CheckStatus | null>(null);
   const [selectingPlatform, setSelectingPlatform] = useState(false);
   const [remember, setRemember] = useState(true);
+  const [platformStatus, setPlatformStatus] = useState<
+    Record<string, { configured: boolean; label: string }>
+  >({});
+
+  useEffect(() => {
+    // プラットフォーム設定状態を取得
+    fetch(`${API_BASE}/api/platforms/status`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then(setPlatformStatus)
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const fetchStatus = async () => {
@@ -117,9 +130,15 @@ export default function CheckDetailPage({
   }
 
   const currentStep = STEP_ORDER[data.status] ?? -1;
-  const resultStyle = data.vacancy_result
-    ? RESULT_STYLES[data.vacancy_result] || RESULT_STYLES["該当なし"]
-    : null;
+  const getResultStyle = (result: string) => {
+    if (RESULT_STYLES[result]) return RESULT_STYLES[result];
+    // 部分一致（「確認不可（専任物件の可能性）」など）
+    for (const [key, style] of Object.entries(RESULT_STYLES)) {
+      if (result.startsWith(key)) return style;
+    }
+    return RESULT_STYLES["該当なし"];
+  };
+  const resultStyle = data.vacancy_result ? getResultStyle(data.vacancy_result) : null;
 
   return (
     <div className="space-y-6">
@@ -134,6 +153,10 @@ export default function CheckDetailPage({
         <p className="text-sm text-gray-500 mt-1 break-all">
           {data.submitted_url}
         </p>
+        <div className="flex items-center gap-4 mt-2 text-xs text-gray-400">
+          {data.created_at && <span>作成: {data.created_at}</span>}
+          {data.completed_at && <span>完了: {data.completed_at}</span>}
+        </div>
       </div>
 
       {/* ステップ表示 */}
@@ -209,6 +232,14 @@ export default function CheckDetailPage({
       {data.status === "error" && data.error_message && (
         <div className="rounded-xl p-4 bg-red-50 border border-red-200">
           <p className="text-sm text-red-700">{data.error_message}</p>
+          <button
+            onClick={() => {
+              window.location.href = "/";
+            }}
+            className="mt-3 px-4 py-2 bg-red-600 text-white rounded-lg text-xs font-medium hover:bg-red-700"
+          >
+            新しいURLで再試行
+          </button>
         </div>
       )}
 
@@ -227,19 +258,31 @@ export default function CheckDetailPage({
             {(
               [
                 ["itanji", "イタンジBB"],
-                ["ierabu", "いえらぶBB"],
                 ["es_square", "いい生活スクエア"],
               ] as const
-            ).map(([key, label]) => (
-              <button
-                key={key}
-                onClick={() => handlePlatformSelect(key)}
-                disabled={selectingPlatform}
-                className="px-4 py-3 border border-gray-300 rounded-lg text-sm font-medium hover:bg-blue-50 hover:border-blue-300 disabled:opacity-50 transition-colors"
-              >
-                {label}
-              </button>
-            ))}
+            ).map(([key, label]) => {
+              const status = platformStatus[key];
+              const isConfigured = status?.configured !== false;
+              return (
+                <button
+                  key={key}
+                  onClick={() => handlePlatformSelect(key)}
+                  disabled={selectingPlatform}
+                  className={`px-4 py-3 border rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+                    isConfigured
+                      ? "border-gray-300 hover:bg-blue-50 hover:border-blue-300"
+                      : "border-gray-200 text-gray-400 bg-gray-50"
+                  }`}
+                >
+                  {label}
+                  {!isConfigured && (
+                    <span className="block text-[10px] text-gray-400 mt-0.5">
+                      (未設定)
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
           <label className="flex items-center gap-2 mt-4 text-sm text-gray-600">
             <input
@@ -265,8 +308,7 @@ export default function CheckDetailPage({
             ["賃料", data.property_rent],
             ["面積", data.property_area],
             ["間取り", data.property_layout],
-            ["ATBB照合", data.atbb_matched ? "一致" : data.status === "not_found" ? "該当なし" : "照合中"],
-            ["管理会社", data.atbb_company],
+            ["築年月", data.property_build_year],
             ["ポータル", data.portal_source?.toUpperCase()],
           ]
             .filter(([, v]) => v)
@@ -276,6 +318,33 @@ export default function CheckDetailPage({
                 <dd className="text-gray-900 font-medium">{value}</dd>
               </div>
             ))}
+          {/* ATBB照合結果 */}
+          <div className="col-span-2 pt-3 border-t border-gray-100">
+            <dt className="text-gray-500 mb-1">ATBB照合</dt>
+            <dd>
+              {data.atbb_matched ? (
+                <div>
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-green-50 text-green-700 rounded-full text-sm font-medium">
+                    <span className="w-2 h-2 rounded-full bg-green-500" />
+                    一致
+                  </span>
+                  {data.atbb_company && (
+                    <p className="mt-2 text-sm text-gray-700">
+                      <span className="text-gray-500">管理会社:</span>{" "}
+                      {data.atbb_company}
+                    </p>
+                  )}
+                </div>
+              ) : data.status === "not_found" || data.status === "done" ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-orange-50 text-orange-700 rounded-full text-sm font-medium">
+                  <span className="w-2 h-2 rounded-full bg-orange-400" />
+                  該当なし
+                </span>
+              ) : (
+                <span className="text-sm text-gray-400">照合中...</span>
+              )}
+            </dd>
+          </div>
         </dl>
       </div>
     </div>

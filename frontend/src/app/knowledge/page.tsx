@@ -15,13 +15,11 @@ type KnowledgeItem = {
 
 const PLATFORM_LABELS: Record<string, string> = {
   itanji: "イタンジBB",
-  ierabu: "いえらぶBB",
   es_square: "いい生活スクエア",
 };
 
 const PLATFORM_OPTIONS = [
   { value: "itanji", label: "イタンジBB" },
-  { value: "ierabu", label: "いえらぶBB" },
   { value: "es_square", label: "いい生活スクエア" },
 ];
 
