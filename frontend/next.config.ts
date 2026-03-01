@@ -1,11 +1,9 @@
 import type { NextConfig } from "next";
-import path from "path";
 
 const nextConfig: NextConfig = {
-  // Turbopackが日本語パスでクラッシュするためwebpack使用
-  turbopack: {
-    root: path.resolve(__dirname),
-  },
+  // ローカル開発では日本語パスが問題になるため
+  // NEXT_WEBPACK=1 環境変数でwebpack使用可能
+  // Vercelでは自動でTurbopackが使われる（パスがASCIIなので問題なし）
 };
 
 export default nextConfig;
