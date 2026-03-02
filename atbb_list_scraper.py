@@ -9,6 +9,7 @@ import signal
 import io
 import re
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
@@ -88,6 +89,8 @@ TARGET_URL = "https://atbb.athome.co.jp/front-web/mainservlet/bfcm003s201"
 TEST_MODE = False
 TEST_LIMIT = 10
 
+SHIKUGUN_BATCH_SIZE = 3  # 3市区町村ずつ検索（5000件上限対策）
+
 # 対象の都道府県 (ID, 県名)
 TARGET_PREFECTURES = [
     ("13", "東京都"),
@@ -111,18 +114,24 @@ def human_delay(min_sec=0.1, max_sec=0.3):
 if USE_UNDETECTED:
     print("  → undetected-chromedriver でブラウザを起動中...")
     chrome_options = uc.ChromeOptions()
+    chrome_options.page_load_strategy = 'eager'  # DOM Ready即返り（画像待ちしない）
     chrome_options.add_argument("--start-maximized")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
     chrome_options.add_argument("--disable-popup-blocking")
     chrome_options.add_argument("--disable-notifications")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     driver = uc.Chrome(options=chrome_options, use_subprocess=True, version_main=145)
 else:
     options = webdriver.ChromeOptions()
+    options.page_load_strategy = 'eager'  # DOM Ready即返り（画像待ちしない）
     options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-extensions")
     options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
     print("  → ChromeDriverManagerをインストール中...")
     service = Service(ChromeDriverManager().install())
@@ -142,6 +151,18 @@ print("✅ Chromeブラウザの起動が完了しました")
 # グローバル変数
 interrupted = False
 all_properties = []
+deferred_ocr_items = []  # OCR延期リスト: [{property_key, img_url, name}, ...]
+# バックグラウンド画像ダウンローダー（スキャン中に裏でDL開始）
+_bg_executor = ThreadPoolExecutor(max_workers=8)
+_bg_futures = {}  # property_key -> Future[bytes|None]
+
+def _download_single(url):
+    """バックグラウンドで1画像をダウンロード"""
+    try:
+        resp = requests.get(url, timeout=10)
+        return resp.content if resp.status_code == 200 else None
+    except Exception:
+        return None
 
 def signal_handler(sig, frame):
     global interrupted
@@ -192,18 +213,24 @@ def recreate_driver():
 
     if USE_UNDETECTED:
         chrome_options = uc.ChromeOptions()
+        chrome_options.page_load_strategy = 'eager'
         chrome_options.add_argument("--start-maximized")
         chrome_options.add_argument("--disable-blink-features=AutomationControlled")
         chrome_options.add_argument("--disable-popup-blocking")
         chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--disable-extensions")
         chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         driver = uc.Chrome(options=chrome_options, use_subprocess=True, version_main=145)
     else:
         options = webdriver.ChromeOptions()
+        options.page_load_strategy = 'eager'
         options.add_argument("--start-maximized")
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument("--disable-gpu")
+        options.add_argument("--disable-extensions")
         options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
@@ -277,6 +304,20 @@ def wait_for_page_ready(drv, timeout=10, max_retries=2):
             else:
                 print(f"   ⚠️ ページ読み込みタイムアウト（{max_retries}回リロード後も完了せず）→ 続行")
                 return False
+
+
+def wait_for_cards_ready(drv, timeout=10):
+    """物件カードの出現を待機（画像読み込みは待たない・超高速版）"""
+    try:
+        WebDriverWait(drv, timeout).until(
+            lambda d: d.execute_script(
+                "return document.readyState !== 'loading' && "
+                "document.querySelectorAll('.property_card').length > 0"
+            )
+        )
+        return True
+    except Exception:
+        return False
 
 
 def check_and_wait_for_captcha():
@@ -471,6 +512,137 @@ def save_data_to_files():
     （互換性のため空関数として残す）
     """
     pass
+
+
+def batch_ocr_rent_images():
+    """全ページスキャン完了後に賃料画像を一括でOCR処理
+
+    1. 画像URLを並列ダウンロード（ThreadPoolExecutor, 10並列）
+    2. EasyOCRで順次処理
+    3. DB更新
+    """
+    global deferred_ocr_items
+
+    if not deferred_ocr_items:
+        print("\n📋 OCR処理対象の賃料画像なし")
+        return
+
+    if not OCR_AVAILABLE or OCR_READER is None:
+        print(f"\n⚠️ OCRライブラリ未使用（{len(deferred_ocr_items)}件の賃料画像をスキップ）")
+        return
+
+    # 重複除去（同じproperty_keyの画像は1回だけ）
+    seen_keys = set()
+    unique_items = []
+    for item in deferred_ocr_items:
+        if item['property_key'] not in seen_keys:
+            seen_keys.add(item['property_key'])
+            unique_items.append(item)
+    deferred_ocr_items = unique_items
+
+    print(f"\n{'='*50}")
+    print(f"🔍 賃料OCR一括処理を開始（{len(deferred_ocr_items)}件）")
+    print(f"{'='*50}")
+
+    # --- Phase 1: バックグラウンドDL済み画像を回収 + 未DL分を追加DL ---
+    print(f"   📥 画像回収中（スキャン中にバックグラウンドDL済み）...")
+    download_start = time.time()
+
+    downloaded = []
+    extra_downloads = []  # バックグラウンドDLされなかった分
+    for item in deferred_ocr_items:
+        key = item['property_key']
+        future = _bg_futures.get(key)
+        if future:
+            try:
+                img_data = future.result(timeout=30)
+                if img_data:
+                    downloaded.append({
+                        'property_key': key,
+                        'image_data': img_data,
+                        'name': item['name'],
+                    })
+            except Exception:
+                pass
+        else:
+            extra_downloads.append(item)
+
+    # 未DL分があれば追加ダウンロード
+    if extra_downloads:
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures_extra = {}
+            for item in extra_downloads:
+                futures_extra[executor.submit(_download_single, item['img_url'])] = item
+            for future in as_completed(futures_extra):
+                item = futures_extra[future]
+                try:
+                    img_data = future.result()
+                    if img_data:
+                        downloaded.append({
+                            'property_key': item['property_key'],
+                            'image_data': img_data,
+                            'name': item['name'],
+                        })
+                except Exception:
+                    pass
+
+    dl_elapsed = time.time() - download_start
+    print(f"   ✅ 画像回収完了: {len(downloaded)}/{len(deferred_ocr_items)}件 ({dl_elapsed:.1f}秒)")
+
+    if not downloaded:
+        print(f"   ⚠️ ダウンロードできた画像なし → OCR中止")
+        return
+
+    # --- Phase 2: OCR一括処理 + DB更新 ---
+    print(f"   🔍 OCR処理中...")
+    ocr_start = time.time()
+    ocr_success = 0
+    conn = _get_db()
+    now = datetime.now().isoformat()
+
+    try:
+        cursor = conn.cursor()
+        for i, item in enumerate(downloaded):
+            try:
+                results = OCR_READER.readtext(item['image_data'])
+                rent_text = ''
+                for result in results:
+                    text = result[1]
+                    price_match = re.search(r'([\d,\.]+)\s*万?円?', text)
+                    if price_match:
+                        rent_text = price_match.group(0).strip()
+                        if '万' not in rent_text and '円' not in rent_text:
+                            rent_text += '万円'
+                        break
+
+                if rent_text:
+                    rent_normalized = normalize_rent(rent_text)
+                    if rent_normalized:
+                        cursor.execute("""
+                            UPDATE atbb_properties SET rent = ?, updated_at = ?
+                            WHERE property_key = ?
+                        """, (rent_normalized, now, item['property_key']))
+                        ocr_success += 1
+
+                # 進捗表示（50件ごと）
+                if (i + 1) % 50 == 0:
+                    conn.commit()
+                    elapsed = time.time() - ocr_start
+                    rate = (i + 1) / elapsed if elapsed > 0 else 0
+                    remaining = (len(downloaded) - i - 1) / rate if rate > 0 else 0
+                    print(f"      ... {i+1}/{len(downloaded)}件処理済み "
+                          f"({ocr_success}件成功, 残り約{remaining:.0f}秒)")
+
+            except Exception:
+                pass
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    ocr_elapsed = time.time() - ocr_start
+    print(f"   ✅ OCR完了: {ocr_success}/{len(downloaded)}件の賃料を取得 ({ocr_elapsed:.1f}秒)")
+    print(f"   ⏱️ 合計: ダウンロード{dl_elapsed:.1f}秒 + OCR{ocr_elapsed:.1f}秒")
 
 # ============================================================================
 # 賃料テキストの正規化
@@ -1107,8 +1279,9 @@ for (var i = 0; i < cards.length; i++) {
             if (t && t.indexOf('Image(') < 0) rentText = t;
         }
     }
-    // 賃料画像のインデックスを保存（後でOCR用）
+    // 賃料画像のインデックスとURLを保存（後でOCR用）
     var priceImgIdx = priceImg ? priceImg.id.replace('price_img_', '') : '';
+    var priceImgSrc = priceImg ? priceImg.src : '';
 
     // 物件番号: div.bkn_no_copy[data-bukkenno] 属性から取得
     var bukkenNoElem = card.querySelector('.bkn_no_copy[data-bukkenno], [data-bukkenno]');
@@ -1145,6 +1318,7 @@ for (var i = 0; i < cards.length; i++) {
         paymentData: paymentData,
         rentText: rentText,
         priceImgIdx: priceImgIdx,
+        priceImgSrc: priceImgSrc,
         bukkenNo: bukkenNo,
         company: company,
         tel: tel,
@@ -1159,32 +1333,22 @@ def find_and_extract_properties(drv):
     """JS一括実行で全物件データを高速抽出（property_card DOM構造から直接取得）"""
     properties = []
 
-    # ページ全体をスクロールして遅延レンダリングのカードを強制描画
+    # ページ全体をスクロールして遅延レンダリングのカードを強制描画（高速版）
     try:
         card_count = drv.execute_script("return document.querySelectorAll('.property_card').length;")
-        if card_count and card_count > 20:
-            # 100件表示の場合: 段階的スクロールで全カード描画
-            print(f"      [DEBUG] {card_count}件のカード検出 → 段階的スクロールで全描画を確保")
-            drv.execute_script("""
-                var cards = document.querySelectorAll('.property_card');
-                var step = Math.max(1, Math.floor(cards.length / 10));
+        # 全カードを1回のJS実行で強制描画（段階スクロール+トップ復帰を一括実行）
+        drv.execute_script("""
+            var cards = document.querySelectorAll('.property_card');
+            if (cards.length > 0) {
+                var step = Math.max(1, Math.floor(cards.length / 5));
                 for (var i = 0; i < cards.length; i += step) {
                     cards[i].scrollIntoView({behavior: 'instant'});
                 }
-                // 最後のカードも確実に描画
                 cards[cards.length - 1].scrollIntoView({behavior: 'instant'});
-            """)
-            time.sleep(0.5)
-        else:
-            drv.execute_script("""
-                var cards = document.querySelectorAll('.property_card');
-                if (cards.length > 0) {
-                    cards[cards.length - 1].scrollIntoView();
-                }
-            """)
-            time.sleep(0.3)
-        drv.execute_script("window.scrollTo(0, 0);")
-        time.sleep(0.2)
+                window.scrollTo(0, 0);
+            }
+        """)
+        time.sleep(0.1)  # 最小限の描画待ち
     except Exception:
         pass
 
@@ -1222,7 +1386,7 @@ def find_and_extract_properties(drv):
                 }
                 window.scrollTo(0, 0);
             """)
-            time.sleep(0.8)
+            time.sleep(0.15)
             raw_items_retry = drv.execute_script(JS_EXTRACT_ALL)
             if raw_items_retry:
                 # 再試行結果の品質チェック
@@ -1296,9 +1460,10 @@ def find_and_extract_properties(drv):
             if rent_text:
                 data['賃料'] = rent_text
 
-        # 賃料が取れなかった場合、OCRで取得を試みる（後で一括処理）
+        # 賃料が取れなかった場合、画像URLを保存（最後に一括OCR）
         if not data['賃料']:
             data['_price_img_idx'] = item.get('priceImgIdx', '')
+            data['_price_img_src'] = item.get('priceImgSrc', '')
 
         # --- 管理会社情報 ---
         company = item.get('company', '')
@@ -1330,35 +1495,27 @@ def find_and_extract_properties(drv):
                 data['名前'] = '(詳細ページで取得)'
             properties.append(data)
 
-    # --- 賃料OCR一括処理 ---
-    # alt属性が空で賃料が取得できなかったカードの画像をOCRで処理
-    if OCR_AVAILABLE and OCR_READER is not None:
-        rent_missing = [p for p in properties if not p.get('賃料') and p.get('_price_img_idx')]
-        if rent_missing:
-            print(f"      🔍 賃料OCR: {len(rent_missing)}件の画像を処理中...")
-            ocr_success = 0
-            for prop in rent_missing:
-                idx = prop.get('_price_img_idx', '')
-                if not idx:
-                    continue
-                try:
-                    img_el = drv.find_element(By.ID, f"price_img_{idx}")
-                    rent_text = extract_rent_from_image(img_el)
-                    if rent_text and rent_text != '要確認':
-                        rent_normalized = normalize_rent(rent_text)
-                        if rent_normalized:
-                            prop['賃料'] = rent_normalized
-                            ocr_success += 1
-                        else:
-                            prop['賃料'] = rent_text
-                except Exception as e:
-                    pass
-            if rent_missing:
-                print(f"      ✅ 賃料OCR完了: {ocr_success}/{len(rent_missing)}件成功")
+    # --- 賃料OCR: 画像URLを延期リストに保存 + バックグラウンドDL開始 ---
+    rent_missing = [p for p in properties if not p.get('賃料') and p.get('_price_img_src')]
+    if rent_missing:
+        for prop in rent_missing:
+            src = prop.get('_price_img_src', '')
+            if src:
+                key = make_property_key(prop)
+                deferred_ocr_items.append({
+                    'property_key': key,
+                    'img_url': src,
+                    'name': prop.get('名前', ''),
+                })
+                # バックグラウンドでダウンロード開始（スキャンと並行）
+                if key not in _bg_futures:
+                    _bg_futures[key] = _bg_executor.submit(_download_single, src)
+        print(f"      📋 賃料OCR延期: {len(rent_missing)}件（バックグラウンドDL中）")
 
     # 一時フィールドを削除（_btn_idはenrichment後にmainループで削除）
     for prop in properties:
         prop.pop('_price_img_idx', None)
+        prop.pop('_price_img_src', None)
 
     return properties
 
@@ -1500,6 +1657,69 @@ def extract_data_from_text(text):
     return data
 
 
+def chunked(lst, n):
+    """リストをn個ずつのバッチに分割"""
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+
+def get_shikugun_list(drv, area_id):
+    """検索ページの市区郡セレクトボックスからoption一覧を取得
+
+    Returns: [(value, text), ...] のリスト
+    """
+    try:
+        options = drv.execute_script("""
+        var select = document.getElementById('sentaku1ZenShikugun_""" + area_id + """');
+        if (!select) return [];
+        var result = [];
+        for (var i = 0; i < select.options.length; i++) {
+            var opt = select.options[i];
+            if (opt.value) {
+                result.push([opt.value, opt.text.trim()]);
+            }
+        }
+        return result;
+        """)
+        return options or []
+    except Exception as e:
+        print(f"   ⚠️ 市区郡リスト取得エラー: {e}")
+        return []
+
+
+def navigate_to_shikugun_page(drv, wait_obj, area_id, prefecture_name):
+    """検索ページから所在地選択画面まで遷移する（バッチごとに再利用）
+
+    Returns: True if successful, False otherwise
+    """
+    drv.get(TARGET_URL)
+    human_delay(0.5, 1.0)
+    wait_and_accept_alert()
+
+    # 賃貸居住用(06)を選択
+    wait_obj.until(EC.presence_of_element_located((By.NAME, "atbbShumokuDaibunrui")))
+    shumoku_radio = drv.find_element(By.CSS_SELECTOR, "input[name='atbbShumokuDaibunrui'][value='06']")
+    drv.execute_script("arguments[0].click();", shumoku_radio)
+
+    # すべてのエリアチェックを外し、対象の都道府県のみチェック
+    area_boxes = drv.find_elements(By.CSS_SELECTOR, "input[name='area']")
+    for box in area_boxes:
+        if box.is_selected():
+            drv.execute_script("arguments[0].click();", box)
+    target_box = drv.find_element(By.CSS_SELECTOR, f"input[name='area'][value='{area_id}']")
+    if not target_box.is_selected():
+        drv.execute_script("arguments[0].click();", target_box)
+
+    # 所在地検索ボタン
+    search_btn = wait_obj.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[value='所在地検索']")))
+    drv.execute_script("arguments[0].click();", search_btn)
+    wait_and_accept_alert()
+    human_delay(1.0, 1.5)
+    wait_for_page_ready(drv)
+    wait_and_accept_alert()
+    return True
+
+
 # ============================================================================
 # メイン処理
 # ============================================================================
@@ -1614,365 +1834,353 @@ try:
         print(f"🗺️ 【{prefecture_name}】 のスクレイピングを開始します (ID: {area_id})")
         print(f"==============================================")
 
-        prefecture_failed = False
         prefecture_count_before = len(all_properties)
         prefecture_keys = set()  # この県で今回見つかった物件キーを追跡
 
-        # 物件検索ページへ
-        driver.get(TARGET_URL)
-        human_delay(0.5, 1.0)
-        wait_and_accept_alert()
-
-        print("⚙️ 種目・エリア設定中...")
-
-        # 賃貸居住用(06)を選択
+        # --- 市区郡リストを取得するために検索ページへ遷移 ---
         try:
-            wait.until(EC.presence_of_element_located((By.NAME, "atbbShumokuDaibunrui")))
-            shumoku_radio = driver.find_element(By.CSS_SELECTOR, "input[name='atbbShumokuDaibunrui'][value='06']")
-            driver.execute_script("arguments[0].click();", shumoku_radio)
+            navigate_to_shikugun_page(driver, wait, area_id, prefecture_name)
         except Exception as e:
-            print(f"⚠️ 賃貸居住用選択エラー: {e}")
+            print(f"⚠️ {prefecture_name}の検索ページ遷移エラー: {e}")
             continue
 
-        # すべてのエリアチェックを外し、対象の都道府県のみチェック
-        try:
-            area_boxes = driver.find_elements(By.CSS_SELECTOR, "input[name='area']")
-            for box in area_boxes:
-                if box.is_selected():
-                    driver.execute_script("arguments[0].click();", box)
-
-            target_box = driver.find_element(By.CSS_SELECTOR, f"input[name='area'][value='{area_id}']")
-            if not target_box.is_selected():
-                driver.execute_script("arguments[0].click();", target_box)
-            print(f"✓ {prefecture_name}を選択")
-        except Exception as e:
-            print(f"⚠️ {prefecture_name}選択エラー: {e}")
+        # 市区郡リスト取得
+        print("⚙️ 市区郡リストを取得中...")
+        shikugun_list = get_shikugun_list(driver, area_id)
+        if not shikugun_list:
+            print(f"⚠️ {prefecture_name}: 市区郡リスト取得失敗 → スキップ")
             continue
 
-        # 所在地検索ボタン
-        try:
-            search_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[value='所在地検索']")))
-            driver.execute_script("arguments[0].click();", search_btn)
-        except:
-            print("⚠️ 所在地検索ボタンエラー")
-            continue
+        batches = list(chunked(shikugun_list, SHIKUGUN_BATCH_SIZE))
+        total_batches = len(batches)
+        print(f"📊 {prefecture_name}: {len(shikugun_list)}市区町村 → {total_batches}バッチに分割")
 
-        wait_and_accept_alert()
-        human_delay(1.0, 1.5)
+        # テストモード時は最初のバッチのみ
+        if TEST_MODE:
+            batches = batches[:1]
+            print(f"🧪 テストモード: 最初のバッチのみ処理")
 
-        # ページ読み込み完了を待つ（スタック時は自動リロード）
-        wait_for_page_ready(driver)
-        wait_and_accept_alert()
-
-        # 市区郡全選択
-        print("🏙️ 市区郡全選択")
-        try:
-            wait.until(EC.presence_of_element_located((By.ID, f"sentaku1ZenShikugun_{area_id}")))
-            driver.execute_script(f"""
-            var selectBox = document.getElementById('sentaku1ZenShikugun_{area_id}');
-            for (var i = 0; i < selectBox.options.length; i++) {{
-                selectBox.options[i].selected = true;
-            }}
-            """)
-            driver.find_element(By.ID, "sentaku1SentakuButton").click()
-            wait_and_accept_alert()
-
-            # 条件入力画面へ
-            wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[value='条件入力画面へ']"))).click()
-            wait_and_accept_alert()
-            human_delay(0.5, 1.0)
-        except Exception as e:
-            print(f"⚠️ 市区郡全選択エラー: {e}")
-            continue
-
-        # 条件入力画面 → チェックボックスは何も入れず、そのまま検索
-        print("📝 条件未指定で検索実行...")
-        check_and_wait_for_captcha()
-
-        try:
-            wait.until(EC.presence_of_element_located((By.NAME, "bfcm370s001")))
-
-            # 検索実行（チェックボックスは何も入れない）
-            current_url = driver.current_url
-            try:
-                btn = driver.find_element(By.CSS_SELECTOR, "input[value='検索']")
-            except:
-                btn = driver.find_element(By.XPATH, "//input[@type='submit' and contains(@value, '検索')]")
-
-            driver.execute_script("arguments[0].click();", btn)
-            wait_and_accept_alert()
-
-            # URLが変わるまたはテーブルが見えるまで待機
-            WebDriverWait(driver, 30).until(
-                lambda d: d.current_url != current_url or len(d.find_elements(By.ID, "tbl")) > 0
-            )
-            human_delay(1.0, 1.5)
-            print("✓ 検索結果画面へ遷移成功")
-        except Exception as e:
-            print(f"⚠️ 検索実行エラー: {e}")
-            continue
-
-        # ---------------------------------------------------------
-        # 表示件数を100件に変更（初回のみ。セッション中は維持される）
-        # ---------------------------------------------------------
-        if not display_count_changed:
-            try:
-                count_select = Select(driver.find_element(By.CSS_SELECTOR, "select[name='pngDisplayCount']"))
-                count_select.select_by_value("100")
-                print("🔢 表示件数を100件に変更（セッション中維持）")
-                # onchangeでsubmitPagingActionが発火→ページリロードを待機
-                wait_for_page_ready(driver)
-                human_delay(0.5, 1.0)
-                wait_and_accept_alert()
-                display_count_changed = True
-            except Exception as e:
-                print(f"ℹ️ 表示件数の変更スキップ: {e}")
-
-        # ---------------------------------------------------------
-        # 一覧画面のスクレイピングループ
-        # ---------------------------------------------------------
-        page = 1
         prefecture_page_properties = []  # この県のページ物件を一時保持
+        batch_failed_shikugun = []  # 失敗したバッチの市区町村名
 
-        while not interrupted:
-            print(f"📄 {prefecture_name} - {page}ページ目を取得中...")
+        for batch_idx, batch in enumerate(batches):
+            if interrupted: break
 
-            # 定期的なメモリ解放（50ページごと）
-            if page % 50 == 0 and page > 0:
-                print(f"   🧹 メモリ解放中... (page={page})")
-                # all_propertiesは巨大になるのでSQLiteに保存済みの分は解放
-                all_properties.clear()
-                gc.collect()
-                # ChromeのDOM蓄積を軽減: 不要なログをクリア
+            batch_values = [value for value, name in batch]
+            batch_names = [name for value, name in batch]
+            print(f"\n🗺️ 【{prefecture_name}】バッチ {batch_idx+1}/{total_batches}: {', '.join(batch_names)} ({len(batch)}市区町村)")
+
+            try:
+                # 検索ページへ遷移（バッチごとに再ナビゲーション）
+                navigate_to_shikugun_page(driver, wait, area_id, prefecture_name)
+
+                # このバッチの市区郡のみ選択
+                print(f"🏙️ バッチ内市区郡を選択中...")
+                wait.until(EC.presence_of_element_located((By.ID, f"sentaku1ZenShikugun_{area_id}")))
+                targets_js = json.dumps(batch_values)
+                driver.execute_script(f"""
+                var selectBox = document.getElementById('sentaku1ZenShikugun_{area_id}');
+                var targets = {targets_js};
+                for (var i = 0; i < selectBox.options.length; i++) {{
+                    selectBox.options[i].selected = targets.includes(selectBox.options[i].value);
+                }}
+                """)
+                driver.find_element(By.ID, "sentaku1SentakuButton").click()
+                wait_and_accept_alert()
+
+                # 条件入力画面へ
+                wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input[value='条件入力画面へ']"))).click()
+                wait_and_accept_alert()
+                human_delay(0.5, 1.0)
+
+                # 条件入力画面 → チェックボックスは何も入れず、そのまま検索
+                print("📝 条件未指定で検索実行...")
+                check_and_wait_for_captcha()
+
+                wait.until(EC.presence_of_element_located((By.NAME, "bfcm370s001")))
+
+                current_url = driver.current_url
                 try:
-                    driver.execute_script("if(window.console && console.clear) console.clear();")
-                except Exception:
-                    pass
+                    btn = driver.find_element(By.CSS_SELECTOR, "input[value='検索']")
+                except:
+                    btn = driver.find_element(By.XPATH, "//input[@type='submit' and contains(@value, '検索')]")
 
-            # ページの読み込み完了を待機（スタック時は自動リロード）
-            wait_for_page_ready(driver)
-            human_delay()
+                driver.execute_script("arguments[0].click();", btn)
+                wait_and_accept_alert()
 
-            # === 物件カード検出＆抽出（Selenium直接方式） ===
-            page_properties = find_and_extract_properties(driver)
+                WebDriverWait(driver, 30).until(
+                    lambda d: d.current_url != current_url or len(d.find_elements(By.ID, "tbl")) > 0
+                )
+                human_delay(1.0, 1.5)
+                print("✓ 検索結果画面へ遷移成功")
 
-            # テストモード: 件数制限
-            if TEST_MODE and page_properties:
-                remaining = TEST_LIMIT - len(all_properties)
-                if remaining <= 0:
-                    print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました")
-                    break
-                if len(page_properties) > remaining:
-                    page_properties = page_properties[:remaining]
+            except Exception as batch_nav_err:
+                print(f"⚠️ バッチ {batch_idx+1} ナビゲーションエラー: {batch_nav_err} → スキップ")
+                batch_failed_shikugun.extend(batch_names)
+                continue
 
-            if not page_properties:
-                # 検索結果なし？
-                if driver.find_elements(By.XPATH, "//*[contains(text(), '該当する物件がありません')]"):
-                    print("ℹ️ 該当物件なし")
-                    break
+            # ---------------------------------------------------------
+            # 表示件数を100件に変更（初回のみ。セッション中は維持される）
+            # ---------------------------------------------------------
+            if not display_count_changed:
+                try:
+                    count_select = Select(driver.find_element(By.CSS_SELECTOR, "select[name='pngDisplayCount']"))
+                    count_select.select_by_value("100")
+                    print("🔢 表示件数を100件に変更（セッション中維持）")
+                    wait_for_page_ready(driver)
+                    human_delay(0.5, 1.0)
+                    wait_and_accept_alert()
+                    display_count_changed = True
+                except Exception as e:
+                    print(f"ℹ️ 表示件数の変更スキップ: {e}")
 
-                # リトライ: ページ読み込みが遅い可能性があるので再試行
-                retry_success = False
-                for retry in range(3):
-                    print(f"⚠️ 物件カードが検出できません → リトライ {retry+1}/3 ...")
-                    human_delay(2.0, 3.0)
-                    # ページリロード
+            # ---------------------------------------------------------
+            # 一覧画面のスクレイピングループ
+            # ---------------------------------------------------------
+            page = 1
+            batch_properties = []
+
+            while not interrupted:
+                batch_label = f"{prefecture_name} [{','.join(batch_names)}]"
+                print(f"📄 {batch_label} - {page}ページ目を取得中...")
+
+                # 定期的なメモリ解放（50ページごと）
+                if page % 50 == 0 and page > 0:
+                    print(f"   🧹 メモリ解放中... (page={page})")
+                    all_properties.clear()
+                    gc.collect()
                     try:
-                        driver.refresh()
-                        wait_for_page_ready(driver)
-                        human_delay(1.0, 2.0)
-                    except:
+                        driver.execute_script("if(window.console && console.clear) console.clear();")
+                    except Exception:
                         pass
-                    page_properties = find_and_extract_properties(driver)
-                    if page_properties:
-                        print(f"✓ リトライ{retry+1}回目で {len(page_properties)}件 検出成功")
-                        retry_success = True
+
+                # カードの出現を待機（画像読み込みは待たない・高速版）
+                wait_for_cards_ready(driver)
+
+                # === 物件カード検出＆抽出（Selenium直接方式） ===
+                page_properties = find_and_extract_properties(driver)
+
+                # テストモード: 件数制限
+                if TEST_MODE and page_properties:
+                    remaining = TEST_LIMIT - len(all_properties)
+                    if remaining <= 0:
+                        print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました")
+                        break
+                    if len(page_properties) > remaining:
+                        page_properties = page_properties[:remaining]
+
+                if not page_properties:
+                    # 検索結果なし？
+                    if driver.find_elements(By.XPATH, "//*[contains(text(), '該当する物件がありません')]"):
+                        print("ℹ️ 該当物件なし")
                         break
 
-                if not retry_success:
-                    btn_count = len(driver.find_elements(By.TAG_NAME, 'button'))
-                    card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
-                    print(f"❌ 物件カードが検出できません（button数: {btn_count}, .property_card数: {card_count}）")
-                    print(f"   現在のURL: {driver.current_url}")
-                    prefecture_failed = True
-                    break
-
-            # 県情報を付与
-            for prop in page_properties:
-                prop['抽出県'] = prefecture_name
-
-            # === 詳細ページエンリッチメント（高速化のためデフォルトOFF） ===
-            if ENRICH_DETAILS:
-                enriched_count = 0
-                for i, prop in enumerate(page_properties):
-                    if interrupted:
-                        break
-                    name = prop.get('名前', '')
-                    addr = prop.get('所在地', '')
-                    rent = prop.get('賃料', '')
-                    company = prop.get('管理会社情報', '')
-                    name_missing = (not name or name in ('AT', 'AT ', '', '(詳細ページで取得)') or len(name) <= 2)
-                    addr_missing = (not addr or '▲' in addr or len(addr) <= 3)
-                    rent_missing = (not rent or rent == '要確認')
-                    company_missing = (not company)
-                    needs_enrich = name_missing or addr_missing or rent_missing or company_missing
-                    if needs_enrich:
-                        prop_btn_id = prop.get('_btn_id', '')
-                        prop = enrich_property_from_detail(driver, wait, prop, button_index=i, btn_id=prop_btn_id)
-                        page_properties[i] = prop
-                        enriched_count += 1
-                if enriched_count > 0:
-                    print(f"   ✅ {enriched_count}件の物件情報を詳細ページで補完しました")
-
-            # _btn_id一時フィールドを削除
-            for prop in page_properties:
-                prop.pop('_btn_id', None)
-
-            # === SQLiteにupsert（ページ単位で即時保存） ===
-            page_keys = upsert_properties_to_db(page_properties, prefecture_name)
-            prefecture_keys.update(page_keys)
-
-            added_count = len(page_properties)
-            all_properties.extend(page_properties)
-            prefecture_page_properties.extend(page_properties)
-
-            print(f"   => {added_count}件を処理 (県内総計: {len(prefecture_page_properties)}件, 全体: {len(all_properties)}件)")
-
-            # テストモード: 上限チェック
-            if TEST_MODE and len(all_properties) >= TEST_LIMIT:
-                print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました。ループ終了。")
-                break
-
-            # 次のページへ（リトライ付き）
-            MAX_NEXT_RETRIES = 5
-            next_page_success = False
-            is_last_page = False
-
-            for next_attempt in range(MAX_NEXT_RETRIES):
-                try:
-                    # ドライバーが生きているか確認
-                    if not is_driver_alive(driver):
-                        print(f"   ❌ WebDriver接続切れ検出 (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES})")
-                        # ドライバー再作成 + 再ログイン + 検索復帰
-                        driver = recreate_driver()
-                        wait = WebDriverWait(driver, 30)
-                        if not relogin_and_navigate_to_search(driver, area_id, prefecture_name):
-                            print(f"   ❌ 再ログイン失敗")
-                            continue
-                        # 検索を再実行して結果ページに戻る必要あり → 県ごとループの再開で対応
-                        print(f"   ⚠️ ドライバー再作成後、検索再実行が必要 → 次ページ復帰を試みます")
-                        # ここではbreakして、県ごとの再実行に任せる
-                        break
-
-                    # 次へボタンを探す
-                    next_btn = None
-                    try:
-                        next_btn = driver.find_element(By.CSS_SELECTOR, "a[title='次へ']")
-                    except:
+                    # リトライ: ページ読み込みが遅い可能性があるので再試行
+                    retry_success = False
+                    for retry in range(3):
+                        print(f"⚠️ 物件カードが検出できません → リトライ {retry+1}/3 ...")
+                        human_delay(2.0, 3.0)
                         try:
-                            next_btn = driver.find_element(By.XPATH, "//a[contains(text(), '次へ')]")
+                            driver.refresh()
+                            wait_for_page_ready(driver)
+                            human_delay(1.0, 2.0)
                         except:
                             pass
+                        page_properties = find_and_extract_properties(driver)
+                        if page_properties:
+                            print(f"✓ リトライ{retry+1}回目で {len(page_properties)}件 検出成功")
+                            retry_success = True
+                            break
 
-                    if not next_btn:
-                        print("ℹ️ 次へボタンがないため、終了します")
-                        is_last_page = True
-                        break
-
-                    # disabledチェック
-                    btn_class = next_btn.get_attribute("class") or ""
-                    if "disabled" in btn_class or not next_btn.is_enabled():
-                        print("ℹ️ 最後のページに到達しました")
-                        is_last_page = True
-                        break
-
-                    # クリック実行
-                    driver.execute_script("arguments[0].click();", next_btn)
-                    wait_and_accept_alert()
-
-                    # ページ遷移の待機（余裕を持たせる）
-                    wait_for_page_ready(driver, timeout=20, max_retries=2)
-                    human_delay(0.3, 0.5)
-
-                    # 物件カードの存在確認
-                    card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
-                    if card_count > 0:
-                        page += 1
-                        next_page_success = True
-                        break
-                    else:
-                        # もう少し待ってみる
-                        time.sleep(2)
+                    if not retry_success:
+                        btn_count = len(driver.find_elements(By.TAG_NAME, 'button'))
                         card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
-                        if card_count > 0:
+                        print(f"❌ 物件カードが検出できません（button数: {btn_count}, .property_card数: {card_count}）")
+                        print(f"   現在のURL: {driver.current_url}")
+                        batch_failed_shikugun.extend(batch_names)
+                        break
+
+                # 県情報を付与
+                for prop in page_properties:
+                    prop['抽出県'] = prefecture_name
+
+                # === 詳細ページエンリッチメント（高速化のためデフォルトOFF） ===
+                if ENRICH_DETAILS:
+                    enriched_count = 0
+                    for i, prop in enumerate(page_properties):
+                        if interrupted:
+                            break
+                        name = prop.get('名前', '')
+                        addr = prop.get('所在地', '')
+                        rent = prop.get('賃料', '')
+                        company = prop.get('管理会社情報', '')
+                        name_missing = (not name or name in ('AT', 'AT ', '', '(詳細ページで取得)') or len(name) <= 2)
+                        addr_missing = (not addr or '▲' in addr or len(addr) <= 3)
+                        rent_missing = (not rent or rent == '要確認')
+                        company_missing = (not company)
+                        needs_enrich = name_missing or addr_missing or rent_missing or company_missing
+                        if needs_enrich:
+                            prop_btn_id = prop.get('_btn_id', '')
+                            prop = enrich_property_from_detail(driver, wait, prop, button_index=i, btn_id=prop_btn_id)
+                            page_properties[i] = prop
+                            enriched_count += 1
+                    if enriched_count > 0:
+                        print(f"   ✅ {enriched_count}件の物件情報を詳細ページで補完しました")
+
+                # _btn_id一時フィールドを削除
+                for prop in page_properties:
+                    prop.pop('_btn_id', None)
+
+                # === SQLiteにupsert（ページ単位で即時保存） ===
+                page_keys = upsert_properties_to_db(page_properties, prefecture_name)
+                prefecture_keys.update(page_keys)
+
+                added_count = len(page_properties)
+                all_properties.extend(page_properties)
+                batch_properties.extend(page_properties)
+                prefecture_page_properties.extend(page_properties)
+
+                print(f"   => {added_count}件を処理 (バッチ内: {len(batch_properties)}件, 県内総計: {len(prefecture_page_properties)}件)")
+
+                # テストモード: 上限チェック
+                if TEST_MODE and len(all_properties) >= TEST_LIMIT:
+                    print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました。ループ終了。")
+                    break
+
+                # 次のページへ（リトライ付き）
+                MAX_NEXT_RETRIES = 5
+                next_page_success = False
+                is_last_page = False
+
+                for next_attempt in range(MAX_NEXT_RETRIES):
+                    try:
+                        # ドライバーが生きているか確認
+                        if not is_driver_alive(driver):
+                            print(f"   ❌ WebDriver接続切れ検出 (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES})")
+                            driver = recreate_driver()
+                            wait = WebDriverWait(driver, 30)
+                            if not relogin_and_navigate_to_search(driver, area_id, prefecture_name):
+                                print(f"   ❌ 再ログイン失敗")
+                                continue
+                            print(f"   ⚠️ ドライバー再作成後、検索再実行が必要 → 次ページ復帰を試みます")
+                            break
+
+                        # 次へボタンを探す
+                        next_btn = None
+                        try:
+                            next_btn = driver.find_element(By.CSS_SELECTOR, "a[title='次へ']")
+                        except:
+                            try:
+                                next_btn = driver.find_element(By.XPATH, "//a[contains(text(), '次へ')]")
+                            except:
+                                pass
+
+                        if not next_btn:
+                            print("ℹ️ 次へボタンがないため、終了します")
+                            is_last_page = True
+                            break
+
+                        # disabledチェック
+                        btn_class = next_btn.get_attribute("class") or ""
+                        if "disabled" in btn_class or not next_btn.is_enabled():
+                            print("ℹ️ 最後のページに到達しました")
+                            is_last_page = True
+                            break
+
+                        # クリック実行
+                        driver.execute_script("arguments[0].click();", next_btn)
+                        wait_and_accept_alert()
+
+                        # カード出現を直接待機（画像読み込みは待たない）
+                        cards_found = wait_for_cards_ready(driver, timeout=15)
+
+                        # 物件カードの存在確認
+                        card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card')) if not cards_found else 1
+                        if card_count > 0 or cards_found:
                             page += 1
                             next_page_success = True
                             break
-                        print(f"   ⚠️ 次ページ遷移後にカードなし (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES})")
-
-                except Exception as e:
-                    err_str = str(e)
-                    print(f"   ⚠️ 次へボタンクリック失敗 (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES}): {err_str}")
-
-                    # HTTPConnectionPool timeout → ドライバー死亡の可能性
-                    if "Read timed out" in err_str or "ConnectionReset" in err_str or "RemoteDisconnected" in err_str:
-                        print(f"   → WebDriver接続タイムアウト → ページリフレッシュで復旧を試みます")
-                        time.sleep(5)
-                        if not is_driver_alive(driver):
-                            print(f"   → ドライバー死亡確認 → 再作成します")
-                            try:
-                                driver = recreate_driver()
-                                wait = WebDriverWait(driver, 30)
-                                if relogin_and_navigate_to_search(driver, area_id, prefecture_name):
-                                    # 検索を再実行して現在のページまで復帰
-                                    print(f"   → 再ログイン成功。検索再実行が必要 → 県頭から再実行")
-                                    break
-                            except Exception as recreate_err:
-                                print(f"   ❌ ドライバー再作成失敗: {recreate_err}")
-                            continue
                         else:
-                            # ドライバーは生きている → リフレッシュで回復
+                            # もう少し待ってみる
+                            time.sleep(2)
+                            card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
+                            if card_count > 0:
+                                page += 1
+                                next_page_success = True
+                                break
+                            print(f"   ⚠️ 次ページ遷移後にカードなし (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES})")
+
+                    except Exception as e:
+                        err_str = str(e)
+                        print(f"   ⚠️ 次へボタンクリック失敗 (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES}): {err_str}")
+
+                        # HTTPConnectionPool timeout → ドライバー死亡の可能性
+                        if "Read timed out" in err_str or "ConnectionReset" in err_str or "RemoteDisconnected" in err_str:
+                            print(f"   → WebDriver接続タイムアウト → ページリフレッシュで復旧を試みます")
+                            time.sleep(5)
+                            if not is_driver_alive(driver):
+                                print(f"   → ドライバー死亡確認 → 再作成します")
+                                try:
+                                    driver = recreate_driver()
+                                    wait = WebDriverWait(driver, 30)
+                                    if relogin_and_navigate_to_search(driver, area_id, prefecture_name):
+                                        print(f"   → 再ログイン成功。検索再実行が必要 → 県頭から再実行")
+                                        break
+                                except Exception as recreate_err:
+                                    print(f"   ❌ ドライバー再作成失敗: {recreate_err}")
+                                continue
+                            else:
+                                # ドライバーは生きている → リフレッシュで回復
+                                try:
+                                    driver.refresh()
+                                    wait_for_page_ready(driver, timeout=20, max_retries=2)
+                                    human_delay(1.0, 2.0)
+                                except Exception:
+                                    pass
+                                continue
+                        else:
+                            # その他のエラー → ページリフレッシュしてリトライ
                             try:
                                 driver.refresh()
-                                wait_for_page_ready(driver, timeout=20, max_retries=2)
+                                wait_for_page_ready(driver, timeout=15)
                                 human_delay(1.0, 2.0)
                             except Exception:
-                                pass
+                                time.sleep(3)
                             continue
-                    else:
-                        # その他のエラー → ページリフレッシュしてリトライ
-                        try:
-                            driver.refresh()
-                            wait_for_page_ready(driver, timeout=15)
-                            human_delay(1.0, 2.0)
-                        except Exception:
-                            time.sleep(3)
-                        continue
 
-            if is_last_page:
-                break
-            if not next_page_success:
-                print(f"   ❌ {MAX_NEXT_RETRIES}回リトライしたが次ページに遷移できませんでした → 県のスクレイピングを終了")
-                prefecture_failed = True
+                if is_last_page:
+                    break
+                if not next_page_success:
+                    print(f"   ❌ {MAX_NEXT_RETRIES}回リトライしたが次ページに遷移できませんでした → バッチを終了")
+                    batch_failed_shikugun.extend(batch_names)
+                    break
+
+            print(f"   📊 バッチ {batch_idx+1}/{total_batches} 完了: {len(batch_properties)}件")
+
+            # テストモード上限チェック
+            if TEST_MODE and len(all_properties) >= TEST_LIMIT:
                 break
 
         # === 県ごとの差分更新: 見つからなかった物件を募集終了に ===
         prefecture_count_added = len(prefecture_page_properties)
         db_existing_count = get_db_count(prefecture_name)
 
-        if prefecture_failed:
-            print(f"❌ {prefecture_name}: 取得失敗（{prefecture_count_added}件）— 募集終了マークはスキップ")
-        elif prefecture_count_added == 0:
+        if batch_failed_shikugun:
+            print(f"⚠️ {prefecture_name}: 以下の市区町村はバッチ失敗: {', '.join(batch_failed_shikugun)}")
+
+        if prefecture_count_added == 0:
             print(f"⚠️ {prefecture_name}: 0件（該当物件なし or 取得失敗）— 募集終了マークはスキップ")
         elif db_existing_count > 0 and prefecture_count_added < db_existing_count * 0.5:
-            # 安全バリア: DB内の50%未満しか取得できなかった場合は、中途半端なスクレイプとみなす
-            # （例: 60,000件のうち5,300件しか取れなかった場合に55,000件を募集終了にしない）
             print(f"⚠️ {prefecture_name}: {prefecture_count_added}件 取得（DB内{db_existing_count}件の{prefecture_count_added*100//db_existing_count}%）")
             print(f"   → 取得率50%未満のため、募集終了マークはスキップ（中途半端スクレイプ防止）")
         else:
             print(f"✅ {prefecture_name}: {prefecture_count_added}件 取得完了")
-            # 成功した県のみ、見つからなかった物件を募集終了にマーク
             mark_disappeared_properties(prefecture_name, prefecture_keys)
+
+    # ---------------------------------------------------------
+    # 賃料OCR一括処理（全ページスキャン完了後）
+    # ---------------------------------------------------------
+    batch_ocr_rent_images()
 
     # ---------------------------------------------------------
     # 最終サマリー
