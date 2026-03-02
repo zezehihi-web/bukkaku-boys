@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
 import { NavBar } from "./components/NavBar";
+import { MainContent } from "./components/MainContent";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -15,7 +16,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "空確くん - 空室自動確認",
-  description: "SUUMO/HOMESのURLから空室状況を自動確認",
+  description: "物件ポータルサイトのURLから空室状況を自動確認",
 };
 
 export default function RootLayout({
@@ -29,7 +30,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-gray-50 min-h-screen`}
       >
         <NavBar />
-        <main className="max-w-4xl mx-auto px-6 py-8">{children}</main>
+        <MainContent>{children}</MainContent>
       </body>
     </html>
   );
