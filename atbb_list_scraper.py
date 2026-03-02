@@ -8,6 +8,7 @@ import hashlib
 import signal
 import io
 import re
+import gc
 from datetime import datetime
 from urllib.parse import urlparse
 from pathlib import Path
@@ -168,6 +169,90 @@ def wait_and_accept_alert():
         return True
     except:
         return False
+
+
+def is_driver_alive(drv):
+    """WebDriverが生きているか確認"""
+    try:
+        _ = drv.current_url
+        return True
+    except Exception:
+        return False
+
+
+def recreate_driver():
+    """WebDriverを再作成する（接続タイムアウト時の復旧用）"""
+    global driver, wait
+    print("   🔄 WebDriverを再作成します...")
+    try:
+        driver.quit()
+    except Exception:
+        pass
+    time.sleep(3)
+
+    if USE_UNDETECTED:
+        chrome_options = uc.ChromeOptions()
+        chrome_options.add_argument("--start-maximized")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--disable-popup-blocking")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        driver = uc.Chrome(options=chrome_options, use_subprocess=True, version_main=145)
+    else:
+        options = webdriver.ChromeOptions()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+        options.add_experimental_option('useAutomationExtension', False)
+        options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': 'Object.defineProperty(navigator, "webdriver", { get: () => undefined })'
+        })
+
+    wait = WebDriverWait(driver, 30)
+    print("   ✅ WebDriver再作成完了")
+    return driver
+
+
+def relogin_and_navigate_to_search(drv, area_id, prefecture_name):
+    """再ログインして検索結果ページまで復帰する"""
+    print(f"   🔄 再ログイン → {prefecture_name}の検索結果ページまで復帰中...")
+    drv.get("https://members.athome.jp/portal")
+    wait_for_page_ready(drv, timeout=15)
+
+    try:
+        login_field = WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.ID, "loginFormText"))
+        )
+        login_field.send_keys(LOGIN_ID)
+        pass_field = drv.find_element(By.ID, "passFormText")
+        pass_field.send_keys(PASSWORD)
+        submit = WebDriverWait(drv, 5).until(
+            EC.element_to_be_clickable((By.XPATH, "//input[@type='submit']"))
+        )
+        drv.execute_script("arguments[0].click();", submit)
+        time.sleep(3)
+        wait_for_page_ready(drv, timeout=15)
+    except Exception as e:
+        print(f"   ⚠️ 再ログイン失敗: {e}")
+        return False
+
+    # 同時ログインエラー対応
+    if "ConcurrentLoginException.jsp" in drv.current_url:
+        try:
+            force_btn = WebDriverWait(drv, 5).until(EC.element_to_be_clickable(
+                (By.XPATH, "//input[@type='button' and contains(@value,'強制終了させてATBBを利用する')]")
+            ))
+            drv.execute_script("arguments[0].click();", force_btn)
+            wait_and_accept_alert()
+            time.sleep(3)
+        except Exception:
+            pass
+
+    print(f"   ✅ 再ログイン完了")
+    return True
 
 def wait_for_page_ready(drv, timeout=10, max_retries=2):
     """ページ読み込み完了を待機（スタック対策付き）
@@ -1652,6 +1737,18 @@ try:
         while not interrupted:
             print(f"📄 {prefecture_name} - {page}ページ目を取得中...")
 
+            # 定期的なメモリ解放（50ページごと）
+            if page % 50 == 0 and page > 0:
+                print(f"   🧹 メモリ解放中... (page={page})")
+                # all_propertiesは巨大になるのでSQLiteに保存済みの分は解放
+                all_properties.clear()
+                gc.collect()
+                # ChromeのDOM蓄積を軽減: 不要なログをクリア
+                try:
+                    driver.execute_script("if(window.console && console.clear) console.clear();")
+                except Exception:
+                    pass
+
             # ページの読み込み完了を待機（スタック時は自動リロード）
             wait_for_page_ready(driver)
             human_delay()
@@ -1746,38 +1843,132 @@ try:
                 print(f"🧪 テスト上限 {TEST_LIMIT}件 に達しました。ループ終了。")
                 break
 
-            # 次のページへ
-            next_btn = None
-            try:
-                next_btn = driver.find_element(By.CSS_SELECTOR, "a[title='次へ']")
-            except:
-                try:
-                    next_btn = driver.find_element(By.XPATH, "//a[contains(text(), '次へ')]")
-                except:
-                    pass
+            # 次のページへ（リトライ付き）
+            MAX_NEXT_RETRIES = 5
+            next_page_success = False
+            is_last_page = False
 
-            if next_btn:
+            for next_attempt in range(MAX_NEXT_RETRIES):
                 try:
-                    if "disabled" in (next_btn.get_attribute("class") or "") or not next_btn.is_enabled():
-                        print("ℹ️ 最後のページに到達しました")
+                    # ドライバーが生きているか確認
+                    if not is_driver_alive(driver):
+                        print(f"   ❌ WebDriver接続切れ検出 (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES})")
+                        # ドライバー再作成 + 再ログイン + 検索復帰
+                        driver = recreate_driver()
+                        wait = WebDriverWait(driver, 30)
+                        if not relogin_and_navigate_to_search(driver, area_id, prefecture_name):
+                            print(f"   ❌ 再ログイン失敗")
+                            continue
+                        # 検索を再実行して結果ページに戻る必要あり → 県ごとループの再開で対応
+                        print(f"   ⚠️ ドライバー再作成後、検索再実行が必要 → 次ページ復帰を試みます")
+                        # ここではbreakして、県ごとの再実行に任せる
                         break
 
+                    # 次へボタンを探す
+                    next_btn = None
+                    try:
+                        next_btn = driver.find_element(By.CSS_SELECTOR, "a[title='次へ']")
+                    except:
+                        try:
+                            next_btn = driver.find_element(By.XPATH, "//a[contains(text(), '次へ')]")
+                        except:
+                            pass
+
+                    if not next_btn:
+                        print("ℹ️ 次へボタンがないため、終了します")
+                        is_last_page = True
+                        break
+
+                    # disabledチェック
+                    btn_class = next_btn.get_attribute("class") or ""
+                    if "disabled" in btn_class or not next_btn.is_enabled():
+                        print("ℹ️ 最後のページに到達しました")
+                        is_last_page = True
+                        break
+
+                    # クリック実行
                     driver.execute_script("arguments[0].click();", next_btn)
                     wait_and_accept_alert()
-                    page += 1
+
+                    # ページ遷移の待機（余裕を持たせる）
+                    wait_for_page_ready(driver, timeout=20, max_retries=2)
+                    human_delay(0.3, 0.5)
+
+                    # 物件カードの存在確認
+                    card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
+                    if card_count > 0:
+                        page += 1
+                        next_page_success = True
+                        break
+                    else:
+                        # もう少し待ってみる
+                        time.sleep(2)
+                        card_count = len(driver.find_elements(By.CSS_SELECTOR, '.property_card'))
+                        if card_count > 0:
+                            page += 1
+                            next_page_success = True
+                            break
+                        print(f"   ⚠️ 次ページ遷移後にカードなし (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES})")
+
                 except Exception as e:
-                    print(f"⚠️ 次へボタンクリック失敗: {e}")
-                    break
-            else:
-                print("ℹ️ 次へボタンがないため、終了します")
+                    err_str = str(e)
+                    print(f"   ⚠️ 次へボタンクリック失敗 (リトライ {next_attempt+1}/{MAX_NEXT_RETRIES}): {err_str}")
+
+                    # HTTPConnectionPool timeout → ドライバー死亡の可能性
+                    if "Read timed out" in err_str or "ConnectionReset" in err_str or "RemoteDisconnected" in err_str:
+                        print(f"   → WebDriver接続タイムアウト → ページリフレッシュで復旧を試みます")
+                        time.sleep(5)
+                        if not is_driver_alive(driver):
+                            print(f"   → ドライバー死亡確認 → 再作成します")
+                            try:
+                                driver = recreate_driver()
+                                wait = WebDriverWait(driver, 30)
+                                if relogin_and_navigate_to_search(driver, area_id, prefecture_name):
+                                    # 検索を再実行して現在のページまで復帰
+                                    print(f"   → 再ログイン成功。検索再実行が必要 → 県頭から再実行")
+                                    break
+                            except Exception as recreate_err:
+                                print(f"   ❌ ドライバー再作成失敗: {recreate_err}")
+                            continue
+                        else:
+                            # ドライバーは生きている → リフレッシュで回復
+                            try:
+                                driver.refresh()
+                                wait_for_page_ready(driver, timeout=20, max_retries=2)
+                                human_delay(1.0, 2.0)
+                            except Exception:
+                                pass
+                            continue
+                    else:
+                        # その他のエラー → ページリフレッシュしてリトライ
+                        try:
+                            driver.refresh()
+                            wait_for_page_ready(driver, timeout=15)
+                            human_delay(1.0, 2.0)
+                        except Exception:
+                            time.sleep(3)
+                        continue
+
+            if is_last_page:
+                break
+            if not next_page_success:
+                print(f"   ❌ {MAX_NEXT_RETRIES}回リトライしたが次ページに遷移できませんでした → 県のスクレイピングを終了")
+                prefecture_failed = True
                 break
 
         # === 県ごとの差分更新: 見つからなかった物件を募集終了に ===
         prefecture_count_added = len(prefecture_page_properties)
+        db_existing_count = get_db_count(prefecture_name)
+
         if prefecture_failed:
             print(f"❌ {prefecture_name}: 取得失敗（{prefecture_count_added}件）— 募集終了マークはスキップ")
         elif prefecture_count_added == 0:
             print(f"⚠️ {prefecture_name}: 0件（該当物件なし or 取得失敗）— 募集終了マークはスキップ")
+        elif db_existing_count > 0 and prefecture_count_added < db_existing_count * 0.5:
+            # 安全バリア: DB内の50%未満しか取得できなかった場合は、中途半端なスクレイプとみなす
+            # （例: 60,000件のうち5,300件しか取れなかった場合に55,000件を募集終了にしない）
+            print(f"⚠️ {prefecture_name}: {prefecture_count_added}件 取得（DB内{db_existing_count}件の{prefecture_count_added*100//db_existing_count}%）")
+            print(f"   → 取得率50%未満のため、募集終了マークはスキップ（中途半端スクレイプ防止）")
         else:
             print(f"✅ {prefecture_name}: {prefecture_count_added}件 取得完了")
             # 成功した県のみ、見つからなかった物件を募集終了にマーク

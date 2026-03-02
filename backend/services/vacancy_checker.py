@@ -16,8 +16,11 @@ from backend.database import get_db
 from backend.services.url_parser import parse_portal_url
 from backend.services.property_matcher import match_property
 from backend.services.knowledge_service import lookup_platform, record_usage, is_phone_required
+from backend.services.r2_property_lookup import search_property as r2_search
 from backend.scrapers.itanji_checker import check_vacancy as itanji_check
+from backend.scrapers.itanji_checker import check_vacancy_by_url as itanji_check_by_url
 from backend.scrapers.es_square_checker import check_vacancy as es_square_check
+from backend.scrapers.es_square_checker import check_vacancy_by_url as es_square_check_by_url
 from backend.notifications.line_notifier import send_line_notification
 from backend.notifications.slack_notifier import send_slack_notification
 
@@ -119,10 +122,47 @@ async def _step_match(
     layout: str,
     build_year_text: str = "",
 ):
-    """ステップ2: ATBB照合"""
+    """ステップ2: ATBB照合 + R2ショートカット"""
     matched = await match_property(property_name, address, rent, area, layout, build_year_text)
 
+    # 物件名から号室を分離（property_nameに含まれる場合）
+    original_name = property_name
+    original_room = ""
+    if "/" in property_name:
+        parts = property_name.rsplit("/", 1)
+        original_name = parts[0].strip()
+        original_room = parts[1].strip()
+
     if not matched:
+        # ============================================================
+        # ATBBで見つからない → R2で検索してみる
+        # ATBBにない＝専任とは限らない。R2にあればプラットフォームで確認可能。
+        # ============================================================
+        print(f"[空確] ATBB不一致 → R2フォールバック検索: {original_name} {original_room}")
+        r2_result = await r2_search(original_name, original_room, address)
+
+        if r2_result and r2_result.get("detail_url"):
+            r2_source = r2_result["source"]
+            r2_url = r2_result["detail_url"]
+            r2_score = r2_result.get("score", 0)
+
+            print(f"[空確] R2ヒット（ATBB不一致だがR2にあり）: {r2_source} (score={r2_score})")
+            await _update_status(
+                check_id,
+                atbb_matched=False,
+                platform=r2_source,
+                platform_auto=True,
+                status="checking",
+            )
+
+            try:
+                await _step_check_direct(check_id, r2_url, r2_source, original_room)
+                return  # R2経由で完了
+            except Exception as e:
+                print(f"[空確] R2直接確認失敗（ATBB不一致ケース）: {e}")
+                # R2も失敗 → 確認不可
+
+        # ATBBもR2もダメ → 確認不可
         await _update_status(
             check_id,
             atbb_matched=False,
@@ -139,6 +179,46 @@ async def _step_match(
         atbb_matched=True,
         atbb_company=company_info,
     )
+
+    # ============================================================
+    # ★ R2ショートカット: プラットフォーム検索をスキップ
+    # ATBBでマッチした物件名＋号室でR2を検索し、
+    # ヒットすれば詳細URLに直接アクセスして空室確認
+    # ============================================================
+    atbb_name = matched.get("名前", property_name)
+    atbb_room = matched.get("号室", "") or original_room
+
+    # 複数の名前候補でR2を検索（ATBB名 → 元のSUUMO/HOMES名）
+    r2_result = None
+    for candidate_name in [atbb_name, original_name]:
+        r2_result = await r2_search(candidate_name, atbb_room, address)
+        if r2_result:
+            break
+
+    if r2_result and r2_result.get("detail_url"):
+        r2_source = r2_result["source"]
+        r2_url = r2_result["detail_url"]
+        r2_score = r2_result.get("score", 0)
+
+        # R2でヒット → 直接URLで空室確認
+        print(f"[空確] R2ヒット: {atbb_name} → {r2_source} (score={r2_score})")
+        await _update_status(
+            check_id,
+            platform=r2_source,
+            platform_auto=True,
+            status="checking",
+        )
+
+        try:
+            await _step_check_direct(check_id, r2_url, r2_source, atbb_room)
+            return  # R2経由で完了
+        except Exception as e:
+            print(f"[空確] R2直接確認失敗 → 従来フローにフォールバック: {e}")
+            # R2失敗 → 従来のフローに落ちる
+
+    # ============================================================
+    # 従来フロー: プラットフォーム判定 → 検索確認
+    # ============================================================
 
     # ステップ3: プラットフォーム判定
     company_name = company_info.split(" ")[0] if company_info else ""
@@ -176,8 +256,71 @@ async def _step_match(
         await _update_status(check_id, status="awaiting_platform")
 
 
+async def _step_check_direct(check_id: int, detail_url: str, platform: str, room_number: str = ""):
+    """ステップ4a: R2経由の直接URL空室確認（高速パス）
+
+    R2インデックスから取得した詳細URLに直接アクセスして空室判定を行う。
+    プラットフォーム上での検索ステップを完全にスキップするため大幅に高速。
+    """
+    db = await get_db()
+    try:
+        row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (check_id,))
+        record = await row.fetchone()
+    finally:
+        await db.close()
+
+    if not record:
+        return
+
+    property_name = record["property_name"]
+    property_address = record["property_address"] or ""
+
+    try:
+        if platform == "itanji":
+            result = await itanji_check_by_url(detail_url, room_number)
+        elif platform == "es_square":
+            result = await es_square_check_by_url(detail_url, room_number)
+        else:
+            # いえらぶBB等 → 未対応のため従来フローへ
+            raise RuntimeError(f"R2直接確認未対応のプラットフォーム: {platform}")
+    except Exception as e:
+        # R2直接確認失敗 → エラーをraiseして呼び出し元でフォールバック
+        raise
+
+    # 結果が「該当なし」の場合 → R2のURLが古い可能性があるため、
+    # 従来のフロー（検索ベース）にフォールバックするためraiseする
+    if result == "該当なし":
+        print(f"[空確] R2直接確認で「該当なし」→ 従来フローにフォールバック")
+        raise RuntimeError("R2 URL先で該当なし（URLが古い可能性）")
+
+    # 正常結果
+    await _update_status(
+        check_id,
+        vacancy_result=f"{result}（R2直接確認）",
+        status="done",
+        completed_at=datetime.now().isoformat(),
+    )
+
+    # ナレッジDB更新
+    company_info = record["atbb_company"] or ""
+    company_name_part = company_info.split(" ")[0] if company_info else ""
+    if company_name_part and platform:
+        company_phone_part = ""
+        parts = company_info.split(" ")
+        if len(parts) > 1:
+            company_phone_part = parts[-1]
+        await record_usage(company_name_part, platform, company_phone_part)
+
+    platform_names = {
+        "itanji": "イタンジBB（R2直接）",
+        "es_square": "いい生活スクエア（R2直接）",
+        "ierabu_bb": "いえらぶBB（R2直接）",
+    }
+    await _notify(check_id, property_name, result, platform_names.get(platform, platform))
+
+
 async def _step_check(check_id: int):
-    """ステップ4: 空室確認"""
+    """ステップ4: 空室確認（従来のプラットフォーム検索方式）"""
     db = await get_db()
     try:
         row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (check_id,))

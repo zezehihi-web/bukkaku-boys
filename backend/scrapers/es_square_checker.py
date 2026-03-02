@@ -203,3 +203,40 @@ async def check_vacancy(property_name: str, room_number: str = "", address: str 
     if "申込あり" in body_text or "申込中" in body_text:
         return "申込あり"
     return "募集中"
+
+
+async def check_vacancy_by_url(detail_url: str, room_number: str = "") -> str:
+    """いい生活スクエアの詳細URLに直接アクセスして空室確認（R2連携用）
+
+    R2インデックスから取得した detail_url に直接遷移し、
+    検索ステップをスキップして即座に空室判定を行う。
+
+    Args:
+        detail_url: https://rent.es-square.net/bukken/chintai/search/detail/XXXX
+        room_number: 号室番号（参考情報）
+
+    Returns:
+        '募集中' / '申込あり' / '該当なし'
+    """
+    page = await get_page("es_square")
+    await ensure_logged_in(page)
+
+    print(f"[ES_SQUARE-R2] 詳細URLに直接アクセス: {detail_url}")
+    await page.goto(detail_url, wait_until="load", timeout=30000)
+    await page.wait_for_timeout(3000)
+
+    body_text = await page.inner_text("body")
+
+    # ページが存在するか確認
+    if "見つかりません" in body_text or "404" in (await page.title()):
+        return "該当なし"
+
+    # 募集終了 / 掲載終了チェック
+    if any(kw in body_text for kw in ["募集終了", "掲載終了", "この物件は現在公開されていません"]):
+        return "募集終了"
+
+    # 申込あり チェック
+    if "申込あり" in body_text or "申込中" in body_text:
+        return "申込あり"
+
+    return "募集中"
