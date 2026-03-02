@@ -71,4 +71,21 @@ async def test_page():
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    """ヘルスチェック（各サブシステムの状態を確認）"""
+    checks = {}
+
+    # DB接続チェック
+    try:
+        from backend.database import get_db
+        db = await get_db()
+        await db.execute("SELECT 1")
+        await db.close()
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    # Playwrightスレッドチェック
+    checks["playwright_thread"] = "ok" if playwright_loop.is_alive() else "dead"
+
+    overall = "ok" if all(v == "ok" for v in checks.values()) else "degraded"
+    return {"status": overall, "checks": checks}

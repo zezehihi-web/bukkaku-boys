@@ -100,9 +100,11 @@ ALTER TABLE company_platform_knowledge ADD COLUMN requires_phone BOOLEAN DEFAULT
 
 
 async def get_db() -> aiosqlite.Connection:
-    """データベース接続を取得"""
-    db = await aiosqlite.connect(str(DB_PATH))
+    """データベース接続を取得（タイムアウト付き）"""
+    db = await aiosqlite.connect(str(DB_PATH), timeout=30)
     db.row_factory = aiosqlite.Row
+    # WALモードでwrite-aheadログを使用（同時読み書き時のロックを大幅軽減）
+    await db.execute("PRAGMA journal_mode=WAL")
     return db
 
 

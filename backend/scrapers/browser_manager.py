@@ -38,13 +38,19 @@ async def get_page(platform: str) -> Page:
     async with _lock:
         if platform in _pages:
             page = _pages[platform]
-            # ページがまだ生きているか確認
+            # ページがまだ生きているか確認（5秒タイムアウト）
             try:
-                await page.title()
+                await asyncio.wait_for(page.title(), timeout=5)
                 return page
             except Exception:
-                # ページが閉じている→再作成
-                pass
+                # ページが閉じている or 応答なし → 再作成
+                try:
+                    ctx = _contexts.pop(platform, None)
+                    if ctx:
+                        await ctx.close()
+                except Exception:
+                    pass
+                _pages.pop(platform, None)
 
         browser = await _ensure_browser()
         context = await browser.new_context(
@@ -52,6 +58,9 @@ async def get_page(platform: str) -> Page:
             viewport={"width": 1280, "height": 900},
         )
         page = await context.new_page()
+        # 全ページ操作にデフォルトタイムアウト（60秒）
+        page.set_default_timeout(60000)
+        page.set_default_navigation_timeout(60000)
         _contexts[platform] = context
         _pages[platform] = page
         return page

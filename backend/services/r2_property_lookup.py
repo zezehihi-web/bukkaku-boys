@@ -42,13 +42,18 @@ R2_CONFIGURED = bool(R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY
 
 
 def _get_s3_client():
-    """S3互換クライアントを取得"""
+    """S3互換クライアントを取得（タイムアウト付き）"""
     return boto3.client(
         "s3",
         endpoint_url=R2_ENDPOINT,
         aws_access_key_id=R2_ACCESS_KEY_ID,
         aws_secret_access_key=R2_SECRET_ACCESS_KEY,
-        config=Config(signature_version="s3v4"),
+        config=Config(
+            signature_version="s3v4",
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2},
+        ),
         region_name="auto",
     )
 
