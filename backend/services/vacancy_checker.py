@@ -4,11 +4,13 @@
 1. URL解析（SUUMO/HOMES → 物件情報抽出）
 2. ATBB照合（物件名・住所・面積・築年数でマッチング）
 3. プラットフォーム判定（ナレッジDB参照）
-4. 空室確認（Playwright経由）
+4. 空室確認（Playwright経由）— プラットフォーム別レートリミット付き
 5. 確認不可→電話確認タスク生成
 6. 結果通知（LINE/Slack）
 """
 
+import asyncio
+import time
 import traceback
 from datetime import datetime
 
@@ -21,25 +23,133 @@ from backend.scrapers.itanji_checker import check_vacancy as itanji_check
 from backend.scrapers.itanji_checker import check_vacancy_by_url as itanji_check_by_url
 from backend.scrapers.es_square_checker import check_vacancy as es_square_check
 from backend.scrapers.es_square_checker import check_vacancy_by_url as es_square_check_by_url
+from backend.scrapers.goweb_checker import check_vacancy as goweb_check
+from backend.scrapers.bukkaku_checker import check_vacancy as bukkaku_check
+from backend.scrapers.es_b2b_checker import check_vacancy as es_b2b_check
+from backend.scrapers.ierabu_bb_checker import check_vacancy as ierabu_bb_check
+from backend.scrapers.realpro_checker import check_vacancy as realpro_check
+from backend.scrapers.browser_manager import platform_lock
+from backend.credentials_map import get_platform_key, parse_platform_key
 from backend.notifications.line_notifier import send_line_notification
-from backend.notifications.slack_notifier import send_slack_notification
+# Slack通知は一時無効化（復活時にコメント解除）
+# from backend.notifications.slack_notifier import send_slack_notification
+SLACK_ENABLED = False
+
+# ============================================================
+# Neon リスナー用: 差し替え可能な DB I/O 関数
+# ============================================================
+# デフォルト: None → 既存SQLiteロジックを使用
+# neon_listener.py からset_status_updater/set_record_fetcher で差し替え
+_status_updater = None
+_record_fetcher = None
+
+
+def set_status_updater(fn):
+    """ステータス更新関数を差し替え（Neonリスナー用）"""
+    global _status_updater
+    _status_updater = fn
+
+
+def set_record_fetcher(fn):
+    """レコード取得関数を差し替え（Neonリスナー用）"""
+    global _record_fetcher
+    _record_fetcher = fn
+
+
+# ============================================================
+# プラットフォーム別レートリミッター（IPバン防止）
+# ============================================================
+# プラットフォームごとの最小間隔（秒）
+_RATE_LIMITS = {
+    "itanji": 5,       # 常駐セッション — 検索間隔を確保
+    "es_square": 5,    # 常駐セッション — 検索間隔を確保
+    "goweb": 8,        # オンデマンド — ログイン含む可能性
+    "bukkaku": 8,      # オンデマンド — サブドメイン別だがIPは同じ
+    "es_b2b": 8,       # オンデマンド — SAML SSO含む可能性
+    "ierabu_bb": 15,   # IPバン実績あり — 慎重に: 15秒間隔
+    "realpro": 8,      # リアルネットプロ — 中程度の間隔
+}
+_DEFAULT_RATE_LIMIT = 5
+
+# 最終リクエスト時刻を記録（プラットフォーム種別ごと）
+_last_request_time: dict[str, float] = {}
+
+
+async def _rate_limit(platform_type: str):
+    """プラットフォームへのリクエスト前にレート制限を適用"""
+    min_interval = _RATE_LIMITS.get(platform_type, _DEFAULT_RATE_LIMIT)
+    now = time.time()
+    last = _last_request_time.get(platform_type, 0)
+    wait = min_interval - (now - last)
+    if wait > 0:
+        print(f"[rate_limit] {platform_type}: {wait:.1f}秒待機（IPバン防止）")
+        await asyncio.sleep(wait)
+    _last_request_time[platform_type] = time.time()
 
 
 async def _update_status(check_id: int, **kwargs):
-    """DBステータスを更新"""
+    """DBステータスを更新（リトライ付き）"""
+    # Neonリスナー経由の場合は差し替え関数を使用
+    if _status_updater:
+        await _status_updater(check_id, **kwargs)
+        return
+
+    # 既存SQLiteロジック（ローカルフロントエンド用）
+    sets = []
+    values = []
+    for key, val in kwargs.items():
+        sets.append(f"{key} = ?")
+        values.append(val)
+    values.append(check_id)
+    sql = f"UPDATE check_requests SET {', '.join(sets)} WHERE id = ?"
+
+    for attempt in range(3):
+        try:
+            db = await get_db()
+            try:
+                await db.execute(sql, values)
+                await db.commit()
+                return
+            finally:
+                await db.close()
+        except Exception as e:
+            if "database is locked" in str(e) and attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+
+
+async def run_vacancy_check_from_property_info(
+    check_id: int,
+    property_name: str,
+    address: str,
+    rent: str,
+    area: str,
+    layout: str,
+    build_year: str,
+):
+    """図面解析結果からの空室確認（URLパースをスキップ、ATBB照合から開始）"""
+    try:
+        await _step_match(check_id, property_name, address, rent, area, layout, build_year)
+    except Exception as e:
+        await _update_status(
+            check_id,
+            status="error",
+            error_message=f"{type(e).__name__}: {e}",
+        )
+        traceback.print_exc()
+
+
+async def _fetch_record(check_id: int):
+    """DB からレコードを取得（差し替え可能）"""
+    if _record_fetcher:
+        return await _record_fetcher(check_id)
+
+    # 既存SQLiteロジック
     db = await get_db()
     try:
-        sets = []
-        values = []
-        for key, val in kwargs.items():
-            sets.append(f"{key} = ?")
-            values.append(val)
-        values.append(check_id)
-        await db.execute(
-            f"UPDATE check_requests SET {', '.join(sets)} WHERE id = ?",
-            values,
-        )
-        await db.commit()
+        row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (check_id,))
+        return await row.fetchone()
     finally:
         await db.close()
 
@@ -47,12 +157,7 @@ async def _update_status(check_id: int, **kwargs):
 async def run_vacancy_check(check_id: int):
     """空室確認メイン処理（バックグラウンドタスク）"""
     try:
-        db = await get_db()
-        try:
-            row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (check_id,))
-            record = await row.fetchone()
-        finally:
-            await db.close()
+        record = await _fetch_record(check_id)
 
         if not record:
             return
@@ -244,7 +349,21 @@ async def _step_match(
 
     platform = await lookup_platform(company_name, company_phone)
 
-    if platform:
+    if platform == "phone":
+        # 電話確認が必要な管理会社（静的マッピング済み）
+        await _create_phone_task(
+            check_id, company_name, company_phone, property_name, address,
+            "ウェブ確認不可（電話確認対象会社）"
+        )
+        await _update_status(
+            check_id,
+            platform="phone",
+            status="done",
+            vacancy_result="電話確認タスク作成済み",
+            completed_at=datetime.now().isoformat(),
+        )
+        await _notify(check_id, property_name, "電話確認が必要です", "")
+    elif platform:
         await _update_status(
             check_id,
             platform=platform,
@@ -262,12 +381,7 @@ async def _step_check_direct(check_id: int, detail_url: str, platform: str, room
     R2インデックスから取得した詳細URLに直接アクセスして空室判定を行う。
     プラットフォーム上での検索ステップを完全にスキップするため大幅に高速。
     """
-    db = await get_db()
-    try:
-        row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (check_id,))
-        record = await row.fetchone()
-    finally:
-        await db.close()
+    record = await _fetch_record(check_id)
 
     if not record:
         return
@@ -276,13 +390,17 @@ async def _step_check_direct(check_id: int, detail_url: str, platform: str, room
     property_address = record["property_address"] or ""
 
     try:
-        if platform == "itanji":
-            result = await itanji_check_by_url(detail_url, room_number)
-        elif platform == "es_square":
-            result = await es_square_check_by_url(detail_url, room_number)
-        else:
-            # いえらぶBB等 → 未対応のため従来フローへ
-            raise RuntimeError(f"R2直接確認未対応のプラットフォーム: {platform}")
+        async with platform_lock(platform):
+            await _rate_limit(platform)
+            if platform == "itanji":
+                result = await itanji_check_by_url(detail_url, room_number)
+            elif platform == "es_square":
+                result = await es_square_check_by_url(detail_url, room_number)
+            elif platform == "ierabu_bb":
+                # いえらぶBBはR2直接URLなし → 従来フローで検索
+                raise RuntimeError("いえらぶBBはR2直接確認未対応 → 検索フロー")
+            else:
+                raise RuntimeError(f"R2直接確認未対応のプラットフォーム: {platform}")
     except Exception as e:
         # R2直接確認失敗 → エラーをraiseして呼び出し元でフォールバック
         raise
@@ -315,18 +433,15 @@ async def _step_check_direct(check_id: int, detail_url: str, platform: str, room
         "itanji": "イタンジBB（R2直接）",
         "es_square": "いい生活スクエア（R2直接）",
         "ierabu_bb": "いえらぶBB（R2直接）",
+        "bukkaku": "物確.com（R2直接）",
+        "es_b2b": "いい生活B2B（R2直接）",
     }
     await _notify(check_id, property_name, result, platform_names.get(platform, platform))
 
 
 async def _step_check(check_id: int):
     """ステップ4: 空室確認（従来のプラットフォーム検索方式）"""
-    db = await get_db()
-    try:
-        row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (check_id,))
-        record = await row.fetchone()
-    finally:
-        await db.close()
+    record = await _fetch_record(check_id)
 
     if not record:
         return
@@ -350,12 +465,34 @@ async def _step_check(check_id: int):
             property_name = property_name[:m.start()].strip()
 
     try:
-        if platform == "itanji":
-            result = await itanji_check(property_name, room_number)
-        elif platform == "es_square":
-            result = await es_square_check(property_name, room_number, property_address)
-        else:
-            result = "該当なし"
+        # プラットフォーム種別でディスパッチ
+        # 複合キー "bukkaku:CIC" / "es_b2b:TFD" の場合は split して credential_key を渡す
+        platform_type, credential_key = parse_platform_key(platform)
+
+        # プラットフォームのページを排他的に使用（同時操作によるTargetClosedError防止）
+        async with platform_lock(platform_type):
+            await _rate_limit(platform_type)
+
+            if platform_type == "itanji":
+                result = await itanji_check(property_name, room_number)
+            elif platform_type == "es_square":
+                result = await es_square_check(property_name, room_number, property_address)
+            elif platform_type == "goweb":
+                result = await goweb_check(property_name, room_number, credential_key)
+            elif platform_type == "bukkaku":
+                result = await bukkaku_check(property_name, room_number, credential_key)
+            elif platform_type == "es_b2b":
+                result = await es_b2b_check(property_name, room_number, credential_key)
+            elif platform_type == "ierabu_bb":
+                result = await ierabu_bb_check(property_name, room_number)
+            elif platform_type == "realpro":
+                result = await realpro_check(property_name, room_number)
+            elif platform_type in ("dkpartners", "skips", "kimaroom"):
+                # 未実装プラットフォーム → 電話確認にフォールバック
+                print(f"[空確] {platform_type}チェッカー未実装: {property_name} → 電話確認")
+                result = "該当なし"
+            else:
+                result = "該当なし"
     except Exception as e:
         # プラットフォームで確認できなかった → 電話確認タスクに振り分け
         err_detail = f"{type(e).__name__}: {e}"
@@ -416,8 +553,12 @@ async def _step_check(check_id: int):
             company_phone_part = parts[-1]
         await record_usage(company_name_part, platform, company_phone_part)
 
-    platform_names = {"itanji": "イタンジBB", "es_square": "いい生活スクエア"}
-    await _notify(check_id, record["property_name"], result, platform_names.get(platform, platform))
+    platform_names = {
+        "itanji": "イタンジBB", "es_square": "いい生活スクエア", "goweb": "GoWeb",
+        "bukkaku": "物確.com", "es_b2b": "いい生活B2B", "ierabu_bb": "いえらぶBB",
+        "realpro": "リアルネットプロ",
+    }
+    await _notify(check_id, record["property_name"], result, platform_names.get(platform_type, platform))
 
 
 async def _create_phone_task(
@@ -450,10 +591,12 @@ async def _create_phone_task(
         f"電話: {company_phone}\n"
         f"理由: {reason}"
     )
-    try:
-        await send_slack_notification(message)
-    except Exception:
-        pass
+    if SLACK_ENABLED:
+        try:
+            from backend.notifications.slack_notifier import send_slack_notification
+            await send_slack_notification(message)
+        except Exception:
+            pass
 
 
 async def _notify(check_id: int, property_name: str, result: str, platform_name: str):
@@ -467,7 +610,9 @@ async def _notify(check_id: int, property_name: str, result: str, platform_name:
     except Exception:
         pass
 
-    try:
-        await send_slack_notification(message)
-    except Exception:
-        pass
+    if SLACK_ENABLED:
+        try:
+            from backend.notifications.slack_notifier import send_slack_notification
+            await send_slack_notification(message)
+        except Exception:
+            pass
