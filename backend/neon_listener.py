@@ -231,14 +231,14 @@ async def main():
     set_record_fetcher(_neon_fetch_record)
 
     # Playwright イベントループを起動
-    from backend.playwright_loop import start_loop
-    start_loop()
+    from backend.services.playwright_loop import ensure_started
+    ensure_started()
 
     # シグナルハンドラ登録
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    print("[neon_listener] 起動完了 — Neon DB をポーリング中 (5秒間隔)")
+    print("[neon_listener] 起動完了 - Neon DB をポーリング中 (5秒間隔)")
     print(f"[neon_listener] DATABASE_URL: ...{DATABASE_URL[-30:]}")
 
     # Stale recovery
@@ -256,7 +256,7 @@ async def main():
             else:
                 await asyncio.sleep(5)
         except psycopg2.OperationalError as e:
-            print(f"[neon_listener] DB接続エラー: {e} — 10秒後にリトライ")
+            print(f"[neon_listener] DB接続エラー: {e} -10秒後にリトライ")
             _reset_conn()
             await asyncio.sleep(10)
         except Exception as e:

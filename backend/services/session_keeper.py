@@ -4,12 +4,13 @@
 定期的にセッション生存を確認、切れていれば再ログインする。
 
 全Playwright操作は playwright_loop の専用スレッドで実行される。
+重要: platform_lock を使用して空室確認との同時操作を防止する。
 """
 
 import asyncio
 import traceback
 
-from backend.scrapers.browser_manager import get_page
+from backend.scrapers.browser_manager import get_page, platform_lock
 
 # セッション確認間隔（秒）
 CHECK_INTERVAL = 300  # 5分ごとにセッション確認
@@ -46,22 +47,28 @@ async def _login_es_square(page):
 
 
 async def _keep_sessions_alive():
-    """定期的にセッション生存を確認し、切れていれば再ログイン"""
+    """定期的にセッション生存を確認し、切れていれば再ログイン
+
+    platform_lock を取得してから操作するため、
+    空室確認の最中にページを奪うことがない。
+    """
     while True:
         try:
             await asyncio.sleep(CHECK_INTERVAL)
 
-            # イタンジBB
+            # イタンジBB — ロックを取得してからページ操作
             try:
-                page = await get_page("itanji")
-                await _login_itanji(page)
+                async with platform_lock("itanji"):
+                    page = await get_page("itanji")
+                    await _login_itanji(page)
             except Exception as e:
                 print(f"[session_keeper] イタンジBB セッション確認エラー: {e}")
 
-            # いい生活スクエア
+            # いい生活スクエア — ロックを取得してからページ操作
             try:
-                page = await get_page("es_square")
-                await _login_es_square(page)
+                async with platform_lock("es_square"):
+                    page = await get_page("es_square")
+                    await _login_es_square(page)
             except Exception as e:
                 print(f"[session_keeper] いい生活スクエア セッション確認エラー: {e}")
 

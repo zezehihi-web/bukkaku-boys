@@ -2,9 +2,14 @@
 
 各プラットフォーム（イタンジBB / いい生活スクエア）ごとに
 独立したブラウザコンテキストを管理し、ログイン状態を維持する。
+
+重要: 各プラットフォームのページは1つしかないため、
+platform_lock() で排他制御し、同時に複数コルーチンが
+同じページを操作しないようにする。
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 _playwright = None
@@ -12,6 +17,9 @@ _browser: Browser | None = None
 _contexts: dict[str, BrowserContext] = {}
 _pages: dict[str, Page] = {}
 _lock = asyncio.Lock()
+
+# プラットフォームごとの排他ロック（同じページの同時操作を防止）
+_platform_locks: dict[str, asyncio.Lock] = {}
 
 
 async def _ensure_browser() -> Browser:
@@ -64,6 +72,34 @@ async def get_page(platform: str) -> Page:
         _contexts[platform] = context
         _pages[platform] = page
         return page
+
+
+def _get_platform_lock(platform: str) -> asyncio.Lock:
+    """プラットフォーム用の排他ロックを取得（なければ作成）"""
+    if platform not in _platform_locks:
+        _platform_locks[platform] = asyncio.Lock()
+    return _platform_locks[platform]
+
+
+@asynccontextmanager
+async def platform_lock(platform: str):
+    """プラットフォームのページを排他的に使用するコンテキストマネージャ
+
+    Usage:
+        async with platform_lock("itanji"):
+            page = await get_page("itanji")
+            await page.goto(...)
+            ...
+
+    これにより、同じプラットフォームのページに対する
+    複数コルーチンの同時操作を防止する。
+    """
+    lock = _get_platform_lock(platform)
+    await lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 async def close_all():

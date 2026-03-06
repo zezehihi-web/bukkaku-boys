@@ -10,6 +10,16 @@ class CheckRequest(BaseModel):
     url: str
 
 
+class PropertyInfoRequest(BaseModel):
+    """図面解析結果からの空室確認リクエスト（URL不要）"""
+    property_name: str
+    address: str = ""
+    rent: str = ""
+    area: str = ""
+    layout: str = ""
+    build_year: str = ""
+
+
 class PlatformSelection(BaseModel):
     """プラットフォーム選択（ユーザー手動）"""
     platform: str  # 'itanji' / 'es_square'

@@ -105,6 +105,8 @@ async def get_db() -> aiosqlite.Connection:
     db.row_factory = aiosqlite.Row
     # WALモードでwrite-aheadログを使用（同時読み書き時のロックを大幅軽減）
     await db.execute("PRAGMA journal_mode=WAL")
+    # busy_timeout: ロック取得まで最大30秒待機（database is locked 防止）
+    await db.execute("PRAGMA busy_timeout=30000")
     return db
 
 

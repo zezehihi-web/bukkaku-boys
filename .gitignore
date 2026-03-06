@@ -33,3 +33,4 @@ image.png
 # デバッグスクリプト（クレデンシャル含む可能性）
 debug_*.py
 fix_*.py
+backend/akikaku.db.bak

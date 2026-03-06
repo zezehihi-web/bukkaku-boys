@@ -2,12 +2,12 @@
 
 SUUMOの物件詳細ページから物件名・住所・賃料・面積・間取り・築年数を取得する。
 
-実DOM構造（2026年2月確認）:
+実DOM構造（2026年3月確認）:
 
-[jnc_ ページ] /chintai/jnc_XXXXXXXXXX/
-- h1.section_h1-header-title: 「路線 駅 N階建 築N年」（物件名でない場合あり）
-- th/td テーブル: 所在地, 専有面積, 間取り, 築年数, 築年月 etc.
-- .property_view_note-emphasis: 賃料（10.9万円）
+[jnc_ ページ] /chintai/jnc_XXXXXXXXXX/?bc=XXXX
+- 2026年3月時点: jnc_ は /library/ ページに301リダイレクトされる
+- ?bc= パラメータがある場合、/chintai/bc_XXXX/ に書き換えて直接取得する
+- bc= が無い場合はリダイレクト先の library ページをパース
 
 [bc_ ページ] /chintai/bc_XXXXXXXXXXXX/
 - h1.section_h1-header-title: 「物件名 N号室 - 不動産会社名が提供する賃貸物件情報」
@@ -15,11 +15,18 @@ SUUMOの物件詳細ページから物件名・住所・賃料・面積・間取
 - .property_view_main-emphasis: 賃料（11万円）
 - .property_view_detail-text: 住所（東京都千代田区麹町２）
 - th/td: 築年月, 構造, 階建 etc.
+
+[library ページ] /library/tf_XX/sc_XXXXX/to_XXXXXXXXXX/
+- jnc_ リダイレクト先。建物単位の情報（部屋単位の賃料・面積は無い）
+- h1（クラス無し）: 「物件名の賃貸物件情報」
+- og:title: 「物件名の賃貸物件・価格情報【SUUMO】」
+- th/td テーブル: 住所, 最寄駅, 築年月, 構造, 階建 etc.
 """
 
 import re
 import asyncio
 import subprocess
+from urllib.parse import urlparse, parse_qs
 import httpx
 from bs4 import BeautifulSoup
 
@@ -54,6 +61,48 @@ async def _fetch_html_bytes(url: str) -> bytes:
         return await loop.run_in_executor(None, _curl_fetch_sync, url)
 
 
+def _clean_parsed_name(name: str) -> str:
+    """パース後の物件名から先頭のゴミ文字を除去
+
+    SUUMOのjnc_ページ等で「・　レッドアイ」のように
+    先頭に中点+全角スペースが付くケースを正規化する。
+    """
+    # 先頭のゴミ文字を除去（中点・ドット・ビュレット・ダッシュ・空白類）
+    name = re.sub(r'^[・·•．.‐‑‒–—―\-_/／,、;；:：\s\u3000]+', '', name)
+    return name.strip()
+
+
+def _extract_room_from_url(url: str) -> str:
+    """URLのbcパラメータ等から部屋識別情報を抽出
+
+    jnc_ページでは同じ建物名に対して ?bc=XXXX で部屋を区別する。
+    bcパラメータの値自体は部屋番号ではないが、異なるbcは異なる部屋を意味する。
+    """
+    m = re.search(r'[?&]bc=([^&]+)', url)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def _rewrite_jnc_to_bc(url: str) -> str | None:
+    """jnc_ URL に ?bc= パラメータがあれば bc_ URL に変換する。
+
+    jnc_ ページは /library/ にリダイレクトされ、部屋単位の賃料・面積等が
+    取得できなくなるため、bc= があれば直接 bc_ ページを取得する。
+    例: /chintai/jnc_000105280906/?bc=100492117886
+      → /chintai/bc_100492117886/
+    """
+    if "/jnc_" not in url:
+        return None
+    parsed = urlparse(url)
+    qs = parse_qs(parsed.query)
+    bc_codes = qs.get("bc", [])
+    if not bc_codes:
+        return None
+    bc_code = bc_codes[0]
+    return f"https://suumo.jp/chintai/bc_{bc_code}/"
+
+
 async def parse_suumo_url(url: str) -> dict:
     """SUUMOの物件詳細URLを解析して物件情報を抽出"""
     result = {
@@ -63,13 +112,22 @@ async def parse_suumo_url(url: str) -> dict:
         "area": "",
         "layout": "",
         "build_year": "",
+        "room": "",  # 号室番号（抽出できた場合）
     }
 
-    html_bytes = await _fetch_html_bytes(url)
+    # jnc_ + ?bc= の場合、bc_ URL に書き換えて部屋単位の情報を取得
+    bc_url = _rewrite_jnc_to_bc(url)
+    fetch_url = bc_url if bc_url else url
+
+    # URLからページ種別を判定
+    is_jnc = "/jnc_" in url and bc_url is None  # リダイレクト先がlibraryになるケース
+
+    html_bytes = await _fetch_html_bytes(fetch_url)
     soup = BeautifulSoup(html_bytes, "lxml", from_encoding="utf-8")
 
     # --- 物件名 ---
     h1 = soup.select_one("h1.section_h1-header-title")
+    room_from_h1 = ""
     if h1:
         h1_text = h1.get_text(strip=True)
         # 「路線 駅 N階建 築N年」パターンは物件名ではない (jnc_ページ)
@@ -77,8 +135,33 @@ async def parse_suumo_url(url: str) -> dict:
             # bc_ページ: 「物件名 4F号室 - 不動産会社が提供する賃貸物件情報」を清掃
             # ※ ー（長音符）を含めると物件名中のカタカナ長音にマッチするため除外
             name = re.sub(r'\s+[-\-–—]\s+.+(?:提供|が提供する).+$', '', h1_text)
-            name = re.sub(r'\s+\d+F?号室$', '', name)
-            result["property_name"] = name.strip()
+            # 号室番号を抽出してから除去
+            room_m = re.search(r'\s+(\d+F?号室)$', name)
+            if room_m:
+                room_from_h1 = re.sub(r'[F号室]', '', room_m.group(1))
+                name = name[:room_m.start()]
+            result["property_name"] = _clean_parsed_name(name)
+
+    # --- library ページのフォールバック ---
+    # jnc_ が /library/ にリダイレクトされた場合、h1にクラスがなく
+    # 「物件名の賃貸物件情報」形式になっている
+    if not result["property_name"]:
+        # og:title から抽出: 「物件名の賃貸物件・価格情報【SUUMO】」
+        og = soup.find("meta", {"property": "og:title"})
+        if og and og.get("content"):
+            og_text = og["content"]
+            # 「XXXの賃貸物件・価格情報【SUUMO】」→ XXX を抽出
+            m = re.match(r'^(.+?)の賃貸物件', og_text)
+            if m:
+                result["property_name"] = _clean_parsed_name(m.group(1))
+        # og:title が無い場合、h1（クラス無し）から抽出
+        if not result["property_name"]:
+            h1_plain = soup.find("h1")
+            if h1_plain:
+                h1_text = h1_plain.get_text(strip=True)
+                m = re.match(r'^(.+?)の賃貸物件情報$', h1_text)
+                if m:
+                    result["property_name"] = _clean_parsed_name(m.group(1))
 
     # --- データ収集（複数ソースから統合） ---
     table_data = {}
@@ -156,6 +239,40 @@ async def parse_suumo_url(url: str) -> dict:
             result["build_year"] = table_data[key]
             break
 
+    # --- 号室抽出 ---
+    room = ""
+    # 1) bc_ページのh1から抽出済み
+    if room_from_h1:
+        room = room_from_h1
+    # 2) テーブルデータから号室/部屋番号を取得
+    if not room:
+        for key in ["号室", "部屋番号", "部屋No"]:
+            if key in table_data:
+                room = re.sub(r'[号室F階]', '', table_data[key]).strip()
+                break
+    # 3) jnc_ページ: 「階建/階」や「階」フィールドから居住階を取得
+    if not room and is_jnc:
+        for key in ["階建/階", "階"]:
+            if key in table_data:
+                # "5階建 / 3階" → "3階" (居住階)
+                floor_m = re.search(r'/\s*(\d+)階', table_data[key])
+                if floor_m:
+                    room = floor_m.group(1) + "階"
+                    break
+                # "3階" (単独) — 階建でないことを確認
+                floor_m = re.search(r'^(\d+)階$', table_data[key].strip())
+                if floor_m:
+                    room = floor_m.group(1) + "階"
+                    break
+
+    result["room"] = room
+
+    # --- 物件名に号室を付加（下流の区別用） ---
+    # vacancy_checkerが "物件名/号室" 形式で分離するため、
+    # 同じ建物名の異なる部屋をURLごとに区別できるようにする
+    if room and result["property_name"]:
+        result["property_name"] = f"{result['property_name']}/{room}"
+
     # --- 正規化 ---
     # 賃料: 万円→円
     rent = result["rent"]
@@ -166,5 +283,14 @@ async def parse_suumo_url(url: str) -> dict:
                 result["rent"] = f"{int(float(m.group(1)) * 10000)}円"
             except ValueError:
                 pass
+
+    # 物件名の最終クリーンアップ（先頭ゴミ文字除去）
+    if result["property_name"]:
+        if "/" in result["property_name"]:
+            parts = result["property_name"].split("/", 1)
+            cleaned = _clean_parsed_name(parts[0])
+            result["property_name"] = f"{cleaned}/{parts[1]}" if cleaned else parts[1]
+        else:
+            result["property_name"] = _clean_parsed_name(result["property_name"])
 
     return result

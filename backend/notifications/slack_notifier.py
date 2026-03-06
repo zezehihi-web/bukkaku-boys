@@ -9,6 +9,9 @@ SLACK_API_URL = "https://slack.com/api/chat.postMessage"
 
 async def send_slack_notification(message: str):
     """Slackでメッセージを送信（Bot Token優先、フォールバックでWebhook）"""
+    # 一時無効化 — 復活時はこのreturnを削除
+    return
+
     if SLACK_BOT_TOKEN and SLACK_CHANNEL:
         async with httpx.AsyncClient() as client:
             resp = await client.post(

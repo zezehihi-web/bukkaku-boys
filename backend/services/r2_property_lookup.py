@@ -5,7 +5,11 @@
 （読み取り専用 — R2への書き込みは一切行わない）
 
 フロー:
-  1. properties_index.json（12,000件超）をR2から取得しメモリキャッシュ
+  1. 個別インデックス（itanji/es_square/ierabu_bb）をR2から取得し統合キャッシュ
+     - itanji_index.json (21,920件)
+     - es_square_index.json (9,328件)
+     - ierabu_bb_index.json (1,325件)
+     → 合計 32,573件
   2. building_name + room_number でマッチング（正規化＋あいまい一致）
   3. ヒット時は detail_url と source（itanji/es_square/ierabu_bb）を返却
 
@@ -85,8 +89,49 @@ def _normalize_room(room: str) -> str:
     return room.strip()
 
 
+INDIVIDUAL_INDEXES = [
+    ("itanji_index.json", "itanji"),
+    ("es_square_index.json", "es_square"),
+    ("ierabu_bb_index.json", "ierabu_bb"),
+]
+
+
+def _parse_json_flexible(raw: str) -> list[dict]:
+    """JSON配列またはJSONL形式をパース"""
+    # まず標準JSON配列を試す
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return [data]
+        return []
+    except json.JSONDecodeError:
+        pass
+
+    # JSONL形式（1行1オブジェクト）を試す
+    items = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                items.append(obj)
+            elif isinstance(obj, list):
+                items.extend(obj)
+        except json.JSONDecodeError:
+            continue
+    return items
+
+
 def _fetch_index() -> list[dict]:
-    """R2からproperties_index.jsonを取得（キャッシュ付き）"""
+    """R2から個別インデックスを取得して統合（キャッシュ付き）
+
+    3つの個別インデックス（itanji/es_square/ierabu_bb）を読み込み統合。
+    合計約32,573件（旧properties_index.jsonの11,257件から約3倍）。
+    """
     now = time.time()
 
     # キャッシュが有効ならそのまま返す
@@ -97,23 +142,61 @@ def _fetch_index() -> list[dict]:
         print("[R2] R2が設定されていません（環境変数を確認してください）")
         return []
 
+    s3 = _get_s3_client()
+    merged = []
+
+    for index_key, source_name in INDIVIDUAL_INDEXES:
+        try:
+            obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=index_key)
+            raw_bytes = obj["Body"].read()
+
+            # エンコーディング: UTF-8 → Shift-JIS フォールバック
+            for enc in ("utf-8", "shift_jis", "cp932"):
+                try:
+                    raw = raw_bytes.decode(enc)
+                    break
+                except (UnicodeDecodeError, ValueError):
+                    continue
+            else:
+                raw = raw_bytes.decode("utf-8", errors="replace")
+
+            # フォーマット: JSON配列 → JSONL フォールバック
+            items = _parse_json_flexible(raw)
+
+            # sourceフィールドがない場合はファイル名から付与
+            for item in items:
+                if not item.get("source"):
+                    item["source"] = source_name
+
+            merged.extend(items)
+            print(f"[R2] {index_key}: {len(items)}件取得")
+        except s3.exceptions.NoSuchKey:
+            print(f"[R2] {index_key}: 存在しません（スキップ）")
+        except Exception as e:
+            print(f"[R2] {index_key}: 取得エラー: {e}")
+
+    if merged:
+        _index_cache["data"] = merged
+        _index_cache["fetched_at"] = now
+        print(f"[R2] インデックス統合完了: 合計{len(merged)}件")
+        return merged
+
+    # 個別インデックスが全て失敗 → 古いキャッシュがあればそれを返す
+    if _index_cache["data"] is not None:
+        print("[R2] 古いキャッシュを使用します")
+        return _index_cache["data"]
+
+    # 最後の手段: 旧properties_index.jsonを試す
     try:
-        s3 = _get_s3_client()
         obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key="properties_index.json")
         raw = obj["Body"].read().decode("utf-8")
         data = json.loads(raw)
-
         _index_cache["data"] = data
         _index_cache["fetched_at"] = now
-        print(f"[R2] インデックス取得完了: {len(data)}件 ({len(raw):,} bytes)")
+        print(f"[R2] フォールバック: properties_index.json {len(data)}件")
         return data
-
     except Exception as e:
-        print(f"[R2] インデックス取得エラー: {e}")
-        # キャッシュが古くてもあればそれを返す
-        if _index_cache["data"] is not None:
-            print("[R2] 古いキャッシュを使用します")
-            return _index_cache["data"]
+        print(f"[R2] フォールバックも失敗: {e}")
         return []
 
 
@@ -241,7 +324,7 @@ async def search_property(
         bname = best_match.get("building_name", "")
         broom = best_match.get("room_number", "")
 
-        print(f"[R2] ✅ ヒット: {bname} {broom} (score={best_score}, source={source})")
+        print(f"[R2] HIT ヒット: {bname} {broom} (score={best_score}, source={source})")
         print(f"[R2]    URL: {detail_url}")
 
         return {
@@ -268,7 +351,7 @@ async def search_property(
             elif "ielove" in url:
                 source = "ierabu_bb"
 
-        print(f"[R2] ✅ 個別ファイルヒット: {individual.get('building_name', '')} (source={source})")
+        print(f"[R2] HIT 個別ファイルヒット: {individual.get('building_name', '')} (source={source})")
         return {
             "detail_url": individual["detail_url"],
             "source": source,
@@ -279,7 +362,7 @@ async def search_property(
             "score": 65,  # 個別ファイルは低めのスコア
         }
 
-    print(f"[R2] ❌ 該当なし: {property_name} {room_number}")
+    print(f"[R2] MISS 該当なし: {property_name} {room_number}")
     return None
 
 

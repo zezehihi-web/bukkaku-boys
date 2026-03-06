@@ -57,11 +57,17 @@ export const RESULT_DETAIL_STYLES: Record<
 export const PLATFORM_LABELS: Record<string, string> = {
   itanji: "イタンジBB",
   es_square: "いい生活スクエア",
+  goweb: "GoWeb",
+  bukkaku: "物確.com",
+  es_b2b: "いい生活B2B",
 };
 
 export const PLATFORM_OPTIONS = [
   { value: "itanji", label: "イタンジBB" },
   { value: "es_square", label: "いい生活スクエア" },
+  { value: "goweb", label: "GoWeb" },
+  { value: "bukkaku", label: "物確.com" },
+  { value: "es_b2b", label: "いい生活B2B" },
 ] as const;
 
 export function getResultStyle(result: string): string {

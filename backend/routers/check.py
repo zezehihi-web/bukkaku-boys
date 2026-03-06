@@ -4,10 +4,12 @@ from datetime import datetime
 
 from fastapi import APIRouter, HTTPException
 
-from backend.config import ITANJI_EMAIL, ES_SQUARE_EMAIL
+from backend.config import ITANJI_EMAIL, ES_SQUARE_EMAIL, GOWEB_USER_ID
+from backend.credentials_map import parse_platform_key
 from backend.database import get_db
-from backend.models import CheckRequest, CheckStatus, CheckListItem, PlatformSelection
+from backend.models import CheckRequest, CheckStatus, CheckListItem, PlatformSelection, PropertyInfoRequest
 from backend.services.vacancy_checker import run_vacancy_check
+from backend.services.url_parser import detect_portal
 
 router = APIRouter(tags=["check"])
 
@@ -25,12 +27,8 @@ async def create_check(req: CheckRequest):
     if not url:
         raise HTTPException(status_code=400, detail="URLが空です")
 
-    # ポータル判定
-    portal = ""
-    if "suumo.jp" in url:
-        portal = "suumo"
-    elif "homes.co.jp" in url:
-        portal = "homes"
+    # ポータル判定（全ポータルサイト自動検出）
+    portal = detect_portal(url) or ""
 
     db = await get_db()
     try:
@@ -49,6 +47,46 @@ async def create_check(req: CheckRequest):
 
     # バックグラウンドで空室確認処理を開始
     _start_background_check(row_id)
+
+    return _row_to_status(record)
+
+
+@router.post("/check/property-info", response_model=CheckStatus)
+async def create_check_from_property_info(req: PropertyInfoRequest):
+    """図面解析結果から空室確認（URLパースをスキップし、ATBB照合から開始）"""
+    if not req.property_name.strip():
+        raise HTTPException(status_code=400, detail="物件名が空です")
+
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """INSERT INTO check_requests
+               (submitted_url, portal_source, property_name, property_address,
+                property_rent, property_area, property_layout, property_build_year,
+                status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'matching')""",
+            (
+                "(図面解析)", "floorplan",
+                req.property_name.strip(), req.address.strip(),
+                req.rent.strip(), req.area.strip(),
+                req.layout.strip(), req.build_year.strip(),
+            ),
+        )
+        await db.commit()
+        row_id = cursor.lastrowid
+
+        row = await db.execute("SELECT * FROM check_requests WHERE id = ?", (row_id,))
+        record = await row.fetchone()
+    finally:
+        await db.close()
+
+    # URLパースをスキップしてATBB照合から開始
+    from backend.services.vacancy_checker import run_vacancy_check_from_property_info
+    from backend.services.playwright_loop import submit_coro
+    submit_coro(run_vacancy_check_from_property_info(
+        row_id, req.property_name.strip(), req.address.strip(),
+        req.rent.strip(), req.area.strip(), req.layout.strip(), req.build_year.strip(),
+    ))
 
     return _row_to_status(record)
 
@@ -98,7 +136,9 @@ async def list_checks(limit: int = 50):
 @router.post("/check/{check_id}/platform")
 async def select_platform(check_id: int, sel: PlatformSelection):
     """ユーザーがプラットフォームを手動選択"""
-    if sel.platform not in ("itanji", "es_square"):
+    # 単純キー "itanji" / 複合キー "bukkaku:CIC" 両対応
+    platform_type, _ = parse_platform_key(sel.platform)
+    if platform_type not in ("itanji", "es_square", "goweb", "bukkaku", "es_b2b"):
         raise HTTPException(status_code=400, detail="無効なプラットフォーム")
 
     db = await get_db()
@@ -149,6 +189,9 @@ async def platform_status():
     return {
         "itanji": {"configured": bool(ITANJI_EMAIL), "label": "イタンジBB"},
         "es_square": {"configured": bool(ES_SQUARE_EMAIL), "label": "いい生活スクエア"},
+        "goweb": {"configured": bool(GOWEB_USER_ID), "label": "GoWeb"},
+        "bukkaku": {"configured": True, "label": "物確.com"},
+        "es_b2b": {"configured": True, "label": "いい生活B2B"},
     }
 
 

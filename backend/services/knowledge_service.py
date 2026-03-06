@@ -1,6 +1,7 @@
 """管理会社→プラットフォーム ナレッジ学習サービス"""
 
 from backend.database import get_db
+from backend.credentials_map import get_platform_key
 
 
 async def lookup_platform(company_name: str, company_phone: str = "") -> str | None:
@@ -44,6 +45,11 @@ async def lookup_platform(company_name: str, company_phone: str = "") -> str | N
 
     finally:
         await db.close()
+
+    # DB未登録 → credentials_mapで静的マッピングを検索
+    platform_key = get_platform_key(company_name)
+    if platform_key:
+        return platform_key
 
     return None
 

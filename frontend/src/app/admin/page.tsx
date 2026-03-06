@@ -220,6 +220,9 @@ export default function AdminDashboard() {
                       [
                         ["itanji", "イタンジBB"],
                         ["es_square", "いい生活スクエア"],
+                        ["goweb", "GoWeb"],
+                        ["bukkaku", "物確.com"],
+                        ["es_b2b", "いい生活B2B"],
                       ] as const
                     ).map(([key, label]) => {
                       const status = platformStatus[key];

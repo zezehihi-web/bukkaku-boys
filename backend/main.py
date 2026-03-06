@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse
 from backend.config import FRONTEND_URL
 from backend.database import init_db
 from backend.routers import check, knowledge, phone_tasks
-from backend.services import playwright_loop, session_keeper, atbb_scheduler
+from backend.services import playwright_loop, session_keeper, atbb_scheduler, r2_atbb_sync
 
 # テストページのパス
 TEST_HTML = Path(__file__).resolve().parent.parent / "test.html"
@@ -19,7 +19,10 @@ TEST_HTML = Path(__file__).resolve().parent.parent / "test.html"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """起動時にDB初期化、ブラウザ常駐、ATBBスケジューラー起動"""
+    """起動時にDB同期・初期化、ブラウザ常駐、ATBBスケジューラー起動"""
+    # 0. R2からATBB DBを同期（131,486件の最新データを取得）
+    await r2_atbb_sync.startup()
+
     await init_db()
 
     # 1. Playwright専用スレッド起動
@@ -36,6 +39,7 @@ async def lifespan(app: FastAPI):
 
     # --- シャットダウン ---
     await atbb_scheduler.shutdown()
+    await r2_atbb_sync.shutdown()
     session_keeper.shutdown()
     playwright_loop.stop()
     print("[main] 全サービス停止完了")
@@ -52,7 +56,9 @@ app.add_middleware(
         "http://localhost:3002",
         "http://localhost:8001",
         "https://bukkaku-kun.vercel.app",
+        os.environ.get("AKIYA_TOOLS_URL", ""),
     ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

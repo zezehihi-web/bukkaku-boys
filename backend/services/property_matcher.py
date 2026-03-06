@@ -34,6 +34,44 @@ def _normalize(text: str) -> str:
     return "".join(result).replace(" ", "").replace("　", "")
 
 
+def _extract_ward(address: str) -> str:
+    """住所から区/市/郡レベルを抽出
+
+    例:
+    - "東京都足立区XXX" → "足立区"
+    - "板橋区高島平2丁目" → "板橋区"
+    - "埼玉県さいたま市浦和区XXX" → "さいたま市浦和区"
+    - "神奈川県横浜市港北区XXX" → "横浜市港北区"
+    """
+    if not address:
+        return ""
+    addr = _normalize(address)
+    # 都道府県を除去
+    addr = re.sub(r'^(東京都|北海道|(?:京都|大阪)府|.{2,3}県)', '', addr)
+
+    # 政令指定都市（市+区）
+    m = re.match(r'(.+?市.+?区)', addr)
+    if m:
+        return m.group(1)
+
+    # 東京23区など
+    m = re.match(r'(.+?区)', addr)
+    if m:
+        return m.group(1)
+
+    # 市
+    m = re.match(r'(.+?市)', addr)
+    if m:
+        return m.group(1)
+
+    # 郡
+    m = re.match(r'(.+?郡.+?[町村])', addr)
+    if m:
+        return m.group(1)
+
+    return ""
+
+
 def _extract_address_district(address: str) -> str:
     """住所を丁目レベルまで正規化して抽出
 
@@ -124,6 +162,9 @@ def _clean_property_name(name: str) -> str:
     if not name:
         return ""
     name = _normalize(name)
+    # 先頭のゴミ文字を除去（中点・ドット・ビュレット・ダッシュ + 空白）
+    # 例: "・ レッドアイ" → "レッドアイ", "・　レッドアイ" → "レッドアイ"
+    name = re.sub(r'^[・·•．.‐‑‒–—―\-_/／,、;；:：\s]+', '', name)
     # "部屋番号：905" を除去
     name = re.sub(r'部屋番号[：:]?\s*\S+', '', name)
     # カッコ内のカタカナ読み仮名を除去
@@ -175,7 +216,11 @@ async def match_property(
     Returns:
         マッチしたATBBレコード(dict) or None
     """
-    target_name = _clean_property_name(property_name)
+    # 物件名から号室を分離（"物件名/号室" 形式）
+    clean_name = property_name
+    if "/" in property_name:
+        clean_name = property_name.rsplit("/", 1)[0].strip()
+    target_name = _clean_property_name(clean_name)
     target_district = _extract_address_district(address)
     target_area = _extract_area_m2(area)
     target_build_year = _extract_build_year(build_year_text)
@@ -236,6 +281,8 @@ async def match_property(
                 return _row_to_dict(best_name_match)
 
         # === 戦略2: 住所（丁目）+ 専有面積 ===
+        target_ward = _extract_ward(address)
+
         if target_district and target_area is not None:
             # 住所にtarget_districtを含む物件を検索
             cursor = await db.execute(
@@ -246,6 +293,11 @@ async def match_property(
 
             area_matches = []
             for row in addr_candidates:
+                # 区/市レベルの一致を必須とする
+                atbb_ward = _extract_ward(row["address"] or "")
+                if target_ward and atbb_ward and target_ward != atbb_ward:
+                    continue
+
                 atbb_district = _extract_address_district(row["address"] or "")
                 if target_district != atbb_district:
                     continue
@@ -258,24 +310,45 @@ async def match_property(
                 if area_diff <= 1.0:
                     area_matches.append((row, area_diff))
 
-            if len(area_matches) == 1:
-                return _row_to_dict(area_matches[0][0])
-
-            if len(area_matches) > 1:
+            # 物件名が空の場合はより厳格な検証を要求
+            if not target_name:
+                # 物件名なし: 築年数による追加検証を必須とする
                 if target_build_year is not None:
+                    verified = []
                     for row, area_diff in area_matches:
                         atbb_build_year = _extract_build_year(row["build_year"] or "")
                         if atbb_build_year and abs(target_build_year - atbb_build_year) <= 1:
-                            return _row_to_dict(row)
+                            verified.append((row, area_diff))
+                    if len(verified) == 1:
+                        return _row_to_dict(verified[0][0])
+                    elif len(verified) > 1:
+                        verified.sort(key=lambda x: x[1])
+                        return _row_to_dict(verified[0][0])
+                # 物件名なし+築年数なし → 戦略2ではマッチさせない（誤マッチ防止）
+            else:
+                # 物件名ありの場合は従来ロジック
+                if len(area_matches) == 1:
+                    return _row_to_dict(area_matches[0][0])
 
-                area_matches.sort(key=lambda x: x[1])
-                return _row_to_dict(area_matches[0][0])
+                if len(area_matches) > 1:
+                    if target_build_year is not None:
+                        for row, area_diff in area_matches:
+                            atbb_build_year = _extract_build_year(row["build_year"] or "")
+                            if atbb_build_year and abs(target_build_year - atbb_build_year) <= 1:
+                                return _row_to_dict(row)
+
+                    area_matches.sort(key=lambda x: x[1])
+                    return _row_to_dict(area_matches[0][0])
 
         # === 戦略3: フォールバック（スコアリング） ===
+        # 物件名が空の場合はフォールバックを実行しない（誤マッチ防止）
+        if not target_name:
+            return None
+
         # 全件スキャンは避け、名前/住所の部分一致で候補を絞る
         fallback_candidates = []
 
-        if target_name and len(target_name) >= 3:
+        if len(target_name) >= 3:
             # 名前の最初の3文字で候補を絞る
             prefix = target_name[:3]
             cursor = await db.execute(
@@ -302,6 +375,11 @@ async def match_property(
             score = 0.0
             atbb_name = _clean_property_name(row["name"] or "")
 
+            # 区/市レベルの一致を必須とする
+            atbb_ward = _extract_ward(row["address"] or "")
+            if target_ward and atbb_ward and target_ward != atbb_ward:
+                continue
+
             if target_name and atbb_name:
                 name_sim = _similarity(target_name, atbb_name)
                 score += 50.0 * name_sim
@@ -327,7 +405,7 @@ async def match_property(
                 best_fallback_score = score
                 best_fallback = row
 
-        if best_fallback_score >= 35.0:
+        if best_fallback_score >= 40.0:
             return _row_to_dict(best_fallback)
 
     return None
