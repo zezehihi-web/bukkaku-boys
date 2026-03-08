@@ -9,8 +9,11 @@ platform_lock() で排他制御し、同時に複数コルーチンが
 """
 
 import asyncio
+import sys
 from contextlib import asynccontextmanager
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+
+_IS_LINUX = sys.platform.startswith("linux")
 
 _playwright = None
 _browser: Browser | None = None
@@ -28,11 +31,12 @@ async def _ensure_browser() -> Browser:
     if _browser is None or not _browser.is_connected():
         _playwright = await async_playwright().start()
         _browser = await _playwright.chromium.launch(
-            headless=False,
+            headless=_IS_LINUX,  # Linux(bravo)=headless, Windows=headed
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--start-maximized",
-            ],
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ] + ([] if _IS_LINUX else ["--start-maximized"]),
         )
     return _browser
 

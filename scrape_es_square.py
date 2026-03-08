@@ -960,7 +960,8 @@ SOURCE_ID = "es_square"
 
 
 def download_r2_index_raw() -> list[dict]:
-    """R2上の properties_index.json を取得して全件リストで返す（他スクレイパーのデータも含む）"""
+    """R2上の properties_index.json を取得して全件リストで返す（他スクレイパーのデータも含む）。
+    sync_local_and_r2 で他スクレイパーのデータを保護するために使用。"""
     if not is_r2_ready():
         return []
     try:
@@ -977,95 +978,141 @@ def download_r2_index_raw() -> list[dict]:
         return []
 
 
+def _download_own_r2_index() -> list[dict] | None:
+    """R2から es_square_index.json をダウンロードして返す。"""
+    if not is_r2_ready():
+        return None
+    try:
+        client = get_r2_client()
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        tmp.close()
+        client.download_file(R2_BUCKET_NAME, "es_square_index.json", tmp.name)
+        with open(tmp.name, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        os.remove(tmp.name)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "404" in err_msg or "not found" in err_msg:
+            print("[R2] es_square_index.json 未存在(404) → 新規作成として続行")
+            return []
+        print(f"[R2] es_square_index.json DL失敗: {e}")
+        return None
+
+
 def download_index_from_r2() -> bool:
-    """
-    R2からproperties_index.jsonをダウンロードし、このスクレイパー(es_square)の物件のみ
-    ローカルのINDEX_FILEに保存する。
-    R2上のインデックスには他スクレイパー(itanji等)のデータも含まれるため分離が必要。
-    """
+    """R2から es_square_index.json をDLしローカルに保存。"""
     if not is_r2_ready():
         return False
     try:
-        all_data = download_r2_index_raw()
-        if not all_data:
-            print("[R2] properties_index.json のダウンロード: ファイルが空または存在しない")
+        my_data = _download_own_r2_index()
+        if my_data is None:
+            print("[R2] es_square_index.json のダウンロード: 取得失敗")
             return False
-        # このスクレイパーの物件のみ抽出
-        # sourceが未設定の物件は所属不明のためes_squareとして扱わない（安全側に倒す）
-        my_data = [item for item in all_data if item.get("source") == SOURCE_ID]
+        if not my_data:
+            print("[R2] es_square_index.json のダウンロード: ファイルが空または存在しない")
+            return False
         setup_dirs()
         with open(INDEX_FILE, "w", encoding="utf-8") as f:
             json.dump(my_data, f, ensure_ascii=False, indent=2)
-        print(f"[R2] properties_index.json をR2からダウンロード (全体={len(all_data)}件, {SOURCE_ID}={len(my_data)}件)")
+        print(f"[R2] es_square_index.json をR2からダウンロード ({len(my_data)}件)")
         return True
     except Exception as e:
-        print(f"[R2] properties_index.json のダウンロード: {e}")
+        print(f"[R2] es_square_index.json のダウンロード: {e}")
         return False
 
 
-def upload_merged_index_to_r2() -> None:
-    """
-    ローカルのes_squareインデックスとR2上の他スクレイパーのデータをマージして
-    properties_index.json をR2にアップロードする。
-    これにより、他スクレイパーのデータを上書きしない。
-    """
+def upload_own_index_to_r2(*, replace_mode: bool = False) -> None:
+    """ローカルのes_squareインデックスをR2の es_square_index.json にマージアップロード。
+    既存のR2データを保持し、新規・更新分のみ上書きする（差分マージ方式）。
+    replace_mode=True の場合、ローカルデータでR2を完全置換する（cleanup後用）。"""
     if not is_r2_ready():
         return
     try:
-        # 1. ローカルのes_squareインデックスを読み込み
-        my_data: list[dict] = []
+        # 1. ローカルの新規スクレーピング結果を読み込み
+        new_data: list[dict] = []
         if os.path.exists(INDEX_FILE):
             with open(INDEX_FILE, "r", encoding="utf-8") as f:
-                my_data = json.load(f)
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                new_data = loaded
 
-        # 2. R2上の他スクレイパーのデータを取得
-        all_r2_data = download_r2_index_raw()
-        other_data = [item for item in all_r2_data if item.get("source", SOURCE_ID) != SOURCE_ID]
+        # 2. R2の既存データをダウンロード
+        r2_raw = _download_own_r2_index()
 
-        # 3. マージして重複排除
-        def score_entry(p: dict) -> int:
-            s = 0
-            if isinstance(p.get('local_images'), list) and len(p['local_images']) > 0:
-                s += 100 + len(p['local_images'])
-            if p.get('thumbnail'):
-                s += 50
-            ic = p.get('image_count', 0)
-            if isinstance(ic, str):
-                ic = int(ic) if ic.isdigit() else 0
-            s += ic
-            if p.get('layout') and str(p['layout']).strip() and str(p['layout']).strip() != '-':
-                s += 20
-            if p.get('area') and str(p['area']).strip():
-                s += 10
-            return s
+        # ★ 安全チェック: R2ダウンロード失敗時はアップロード中止（データ損失防止）
+        if r2_raw is None:
+            print("[R2] アップロード中止: R2インデックスのダウンロードに失敗しました。データ損失を防ぐためアップロードをスキップします。")
+            return
+        r2_data: list[dict] = r2_raw
 
-        combined = other_data + my_data
-        best_by_id: dict[str, dict] = {}
-        for prop in combined:
-            pid = prop.get('id')
-            if not pid:
-                continue
-            existing = best_by_id.get(pid)
-            if not existing or score_entry(prop) > score_entry(existing):
-                best_by_id[pid] = prop
-        merged = list(best_by_id.values())
-        print(f"[R2] 重複排除: {len(combined)}件 → {len(merged)}件")
+        if replace_mode:
+            # ★ 置換モード: ローカルデータでR2を完全置換（cleanup後など）
+            result = new_data
+            print(
+                f"[R2] 置換モード: ローカル={len(new_data)}件でR2({len(r2_data)}件)を置換"
+            )
+            if not result:
+                print("[R2] アップロード中止: 置換データが0件")
+                return
+            if r2_data and len(result) < len(r2_data) * 0.5:
+                print(
+                    f"[R2] アップロード中止: 置換後({len(result)}件)がR2既存({len(r2_data)}件)の50%未満。"
+                    f" 異常な減少のためアップロードを中止します。"
+                )
+                return
+        else:
+            # ★ マージモード（通常）: 既存データをベースに、新規データで上書き（IDベース）
+            merged: dict[str, dict] = {}
+            for item in r2_data:
+                pid = str(item.get("id", "")).strip()
+                if pid:
+                    merged[pid] = item
+            new_count = 0
+            updated_count = 0
+            for item in new_data:
+                pid = str(item.get("id", "")).strip()
+                if not pid:
+                    continue
+                if pid in merged:
+                    updated_count += 1
+                else:
+                    new_count += 1
+                merged[pid] = item
 
-        merged_path = os.path.join(OUTPUT_DIR, "_merged_index.json")
-        with open(merged_path, "w", encoding="utf-8") as f:
-            json.dump(merged, f, ensure_ascii=False, separators=(',', ':'))
+            result = list(merged.values())
 
+            if not result:
+                print("[R2] アップロード中止: マージ結果が0件")
+                return
+
+            # 安全チェック: マージ後がR2既存より減少する場合は中止（データ損失防止）
+            if r2_data and len(result) < len(r2_data):
+                print(
+                    f"[R2] アップロード中止: マージ後({len(result)}件)がR2既存({len(r2_data)}件)より少ない。"
+                    f" データ損失を防ぐため中止します。"
+                )
+                return
+
+            print(
+                f"[R2] マージ結果: R2既存={len(r2_data)}件, "
+                f"新規スクレーピング={len(new_data)}件, "
+                f"マージ後={len(result)}件 (新規+{new_count}, 更新={updated_count})"
+            )
+
+        upload_path = os.path.join(OUTPUT_DIR, "_own_index_upload.json")
+        with open(upload_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, separators=(',', ':'))
         client = get_r2_client()
         client.upload_file(
-            merged_path,
-            R2_BUCKET_NAME,
-            "properties_index.json",
+            upload_path, R2_BUCKET_NAME, "es_square_index.json",
             ExtraArgs={"ContentType": "application/json"},
         )
-        os.remove(merged_path)
-        print(f"[R2] マージインデックスをアップロード (es_square={len(my_data)}件 + 他={len(other_data)}件 = {len(merged)}件)")
+        os.remove(upload_path)
+        print(f"[R2] es_square_index.json アップロード完了: {len(result)}件")
     except Exception as e:
-        print(f"[R2] マージインデックスアップロード失敗: {e}")
+        print(f"[R2] es_square_index.json アップロード失敗: {e}")
 
 
 def load_existing_properties() -> dict:
@@ -1201,9 +1248,9 @@ def cleanup_ended_properties(partial: bool = False) -> None:
     if r2_delete_keys:
         delete_r2_keys(sorted(r2_delete_keys))
 
-    # 更新後のインデックスをR2にマージアップロード（他スクレイパーのデータを保持）
+    # 更新後のインデックスをR2に置換アップロード（クリーンアップで削除した物件をR2からも除去）
     if R2_UPLOAD_ENABLED:
-        upload_merged_index_to_r2()
+        upload_own_index_to_r2(replace_mode=True)
 
     print(f"[cleanup] 募集終了: {len(ended_properties)}件, ローカル画像削除: {deleted_local_images}枚, JSON削除: {deleted_detail_json}件")
 
@@ -1272,7 +1319,7 @@ def cleanup_ended_properties_for_block(block_key: str, seen_urls: set[str], seen
     if r2_delete_keys:
         delete_r2_keys(sorted(r2_delete_keys))
     if R2_UPLOAD_ENABLED:
-        upload_merged_index_to_r2()
+        upload_own_index_to_r2(replace_mode=True)
 
     print(f"[cleanup-block] ended={len(ended_properties)} block={block_key} local_images={deleted_local_images} json={deleted_detail_json}")
 
@@ -3434,7 +3481,7 @@ def save_results(properties: list[dict]) -> None:
     if R2_UPLOAD_ENABLED:
         print(f"[R2] JSONデータのアップロードを開始します ({len(upload_targets)}ファイル)")
         upload_files_to_r2(upload_targets)
-        upload_merged_index_to_r2()
+        upload_own_index_to_r2()
 
 
 def compress_images_after_scrape() -> None:
