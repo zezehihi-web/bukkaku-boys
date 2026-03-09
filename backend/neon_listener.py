@@ -53,6 +53,7 @@ _COLUMNS = [
     "atbb_matched", "atbb_company", "platform", "platform_auto",
     "status", "vacancy_result", "error_message",
     "created_at", "completed_at", "updated_at",
+    "line_user_id",
 ]
 
 
@@ -207,6 +208,67 @@ def _recover_stale():
 
 
 # ============================================================
+# awaiting_platform タイムアウト → 電話タスク自動生成
+# ============================================================
+AWAITING_TIMEOUT_MINUTES = 30
+
+
+async def _timeout_awaiting_platform():
+    """awaiting_platform が一定時間経過した行を電話確認タスクに自動変換"""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, property_name, property_address, atbb_company
+                   FROM akikaku_checks
+                   WHERE status = 'awaiting_platform'
+                     AND created_at < NOW() - INTERVAL '%s minutes'""",
+                (AWAITING_TIMEOUT_MINUTES,),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+
+        if not rows:
+            return
+
+        print(f"[neon_listener] awaiting_platform タイムアウト: {len(rows)} 件を電話タスクに変換")
+
+        for row in rows:
+            check_id = row["id"]
+            company = row.get("atbb_company", "") or ""
+            company_name = company.split(" ")[0] if company else ""
+            company_phone = ""
+            parts = company.split(" ")
+            if len(parts) > 1:
+                company_phone = parts[-1]
+
+            try:
+                from backend.services.vacancy_checker import _create_phone_task
+                await _create_phone_task(
+                    check_id, company_name, company_phone,
+                    row.get("property_name", ""),
+                    row.get("property_address", ""),
+                    "プラットフォーム自動判定不可(タイムアウト)"
+                )
+                await _neon_update_status(
+                    check_id,
+                    status="done",
+                    vacancy_result="電話確認タスク作成済み",
+                    completed_at=datetime.now().isoformat(),
+                )
+                print(f"[neon_listener] id={check_id} → 電話タスク変換完了")
+            except Exception as e:
+                print(f"[neon_listener] id={check_id} 電話タスク変換エラー: {e}")
+
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print(f"[neon_listener] タイムアウトチェックエラー: {e}")
+
+
+# ============================================================
 # メインループ
 # ============================================================
 _shutdown = False
@@ -248,6 +310,7 @@ async def main():
         print(f"[neon_listener] Stale recovery エラー: {e}")
 
     # ポーリングループ
+    _timeout_check_counter = 0
     while not _shutdown:
         try:
             job = _pick_job()
@@ -255,6 +318,13 @@ async def main():
                 await _process_job(job)
             else:
                 await asyncio.sleep(5)
+
+            # 60回に1回(約5分ごと)awaiting_platformのタイムアウトチェック
+            _timeout_check_counter += 1
+            if _timeout_check_counter >= 60:
+                _timeout_check_counter = 0
+                await _timeout_awaiting_platform()
+
         except psycopg2.OperationalError as e:
             print(f"[neon_listener] DB接続エラー: {e} -10秒後にリトライ")
             _reset_conn()

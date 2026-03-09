@@ -30,7 +30,7 @@ from backend.scrapers.ierabu_bb_checker import check_vacancy as ierabu_bb_check
 from backend.scrapers.realpro_checker import check_vacancy as realpro_check
 from backend.scrapers.browser_manager import platform_lock
 from backend.credentials_map import get_platform_key, parse_platform_key
-from backend.notifications.line_notifier import send_line_notification
+from backend.notifications.line_notifier import send_line_notification, send_akishitsu_result
 # Slack通知は一時無効化（復活時にコメント解除）
 # from backend.notifications.slack_notifier import send_slack_notification
 SLACK_ENABLED = False
@@ -271,6 +271,8 @@ async def _step_match(
         await _update_status(
             check_id,
             atbb_matched=False,
+            platform="",
+            platform_auto=False,
             status="not_found",
             vacancy_result="確認不可（専任物件の可能性）",
             completed_at=datetime.now().isoformat(),
@@ -372,7 +374,7 @@ async def _step_match(
         )
         await _step_check(check_id)
     else:
-        await _update_status(check_id, status="awaiting_platform")
+        await _update_status(check_id, status="awaiting_platform", platform="", platform_auto=False)
 
 
 async def _step_check_direct(check_id: int, detail_url: str, platform: str, room_number: str = ""):
@@ -600,11 +602,12 @@ async def _create_phone_task(
 
 
 async def _notify(check_id: int, property_name: str, result: str, platform_name: str):
-    """結果を通知"""
+    """結果を通知（管理者 + ユーザー）"""
     message = f"【空確くん】{property_name}\n結果: {result}"
     if platform_name:
         message += f"\n確認先: {platform_name}"
 
+    # 管理者向け通知
     try:
         await send_line_notification(message)
     except Exception:
@@ -616,3 +619,13 @@ async def _notify(check_id: int, property_name: str, result: str, platform_name:
             await send_slack_notification(message)
         except Exception:
             pass
+
+    # ユーザー向けLINEプッシュ通知（line_user_idが紐付いている場合）
+    try:
+        record = await _fetch_record(check_id)
+        if record and record.get("line_user_id"):
+            await send_akishitsu_result(
+                record["line_user_id"], property_name, result, check_id
+            )
+    except Exception:
+        pass
