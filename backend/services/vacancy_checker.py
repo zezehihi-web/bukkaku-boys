@@ -30,7 +30,7 @@ from backend.scrapers.ierabu_bb_checker import check_vacancy as ierabu_bb_check
 from backend.scrapers.realpro_checker import check_vacancy as realpro_check
 from backend.scrapers.browser_manager import platform_lock
 from backend.credentials_map import get_platform_key, parse_platform_key
-from backend.notifications.line_notifier import send_line_notification, send_akishitsu_result
+from backend.notifications.line_notifier import send_line_notification, send_akishitsu_result, set_akishitsu_conversation_state
 # Slack通知は一時無効化（復活時にコメント解除）
 # from backend.notifications.slack_notifier import send_slack_notification
 SLACK_ENABLED = False
@@ -626,6 +626,10 @@ async def _notify(check_id: int, property_name: str, result: str, platform_name:
         if record and record.get("line_user_id"):
             await send_akishitsu_result(
                 record["line_user_id"], property_name, result, check_id
+            )
+            # 会話状態を設定（Webhookでボタン押下を処理するため）
+            await set_akishitsu_conversation_state(
+                record["line_user_id"], check_id, property_name, result
             )
     except Exception:
         pass
