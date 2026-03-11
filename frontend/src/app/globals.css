@@ -12,8 +12,51 @@
   --font-mono: var(--font-geist-mono);
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+/* スケルトンローディング */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, #f0f0f0 25%, #e0e0e0 50%, #f0f0f0 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: 0.5rem;
+}
+
+/* 結果カード出現 */
+@keyframes scaleIn {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+.animate-scale-in {
+  animation: scaleIn 0.3s ease-out;
+}
+
+/* リスト項目フェードイン */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-fade-in {
+  animation: fadeIn 0.2s ease-out both;
+}
+
+/* 穏やかなパルス */
+@keyframes gentlePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+.animate-gentle-pulse {
+  animation: gentlePulse 2s ease-in-out infinite;
 }

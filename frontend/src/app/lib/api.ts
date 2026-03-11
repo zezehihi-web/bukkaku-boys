@@ -1,6 +1,13 @@
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+function getAuthHeaders(): Record<string, string> {
+  if (typeof window === "undefined") return {};
+  const key = localStorage.getItem("admin_api_key");
+  if (key) return { Authorization: `Bearer ${key}` };
+  return {};
+}
+
 export async function apiFetch<T>(
   path: string,
   options?: RequestInit,
@@ -9,6 +16,7 @@ export async function apiFetch<T>(
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...getAuthHeaders(),
       ...options?.headers,
     },
   });

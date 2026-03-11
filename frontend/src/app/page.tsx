@@ -1,31 +1,35 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { API_BASE } from "./lib/api";
-import { USER_STATUS_LABELS, getResultStyle, isProcessing, isTerminal } from "./lib/constants";
+import { isTerminal } from "./lib/constants";
 import type { CheckItem } from "./lib/types";
+import { usePolling } from "./lib/usePolling";
 
 export default function HomePage() {
+  const router = useRouter();
   const [url, setUrl] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [submitSuccess, setSubmitSuccess] = useState(false);
   const [checks, setChecks] = useState<CheckItem[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  useEffect(() => {
-    const fetchChecks = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/checks?limit=20`);
-        if (res.ok) {
-          setChecks(await res.json());
-        }
-      } catch {
-        // API未起動時は静かに失敗
+  const fetchChecks = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/checks?limit=20`);
+      if (res.ok) {
+        setChecks(await res.json());
       }
-    };
-    fetchChecks();
-    const interval = setInterval(fetchChecks, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    } catch {
+      // API未起動時は静かに失敗
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  usePolling(fetchChecks, 5000);
 
   const validateUrl = (input: string): string | null => {
     const trimmed = input.trim();
@@ -61,7 +65,10 @@ export default function HomePage() {
       }
       const data = await res.json();
       setUrl("");
-      window.location.href = `/check/${data.id}`;
+      setSubmitSuccess(true);
+      setTimeout(() => {
+        router.push(`/check/${data.id}`);
+      }, 300);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "エラーが発生しました");
     } finally {
@@ -71,49 +78,94 @@ export default function HomePage() {
 
   return (
     <div className="space-y-8">
-      <section className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-        <h2 className="text-lg font-semibold text-gray-900 mb-4">
-          空室確認
-        </h2>
-        <p className="text-sm text-gray-500 mb-4">
-          物件ポータルサイトのURLを貼り付けて、空室状況を自動確認します
+      {/* URL入力セクション */}
+      <section className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
+        <h2 className="text-xl font-bold text-gray-900 mb-2">空室確認</h2>
+        <p className="text-sm text-gray-500 mb-6">
+          SUUMOまたはHOMESの物件ページURLを貼り付けてください
         </p>
-        <form onSubmit={handleSubmit} className="flex gap-3">
+        <form onSubmit={handleSubmit} className="space-y-3">
           <input
             type="url"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="物件ページのURLを貼り付け"
-            className="flex-1 px-4 py-3 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+            placeholder="https://suumo.jp/... または https://www.homes.co.jp/..."
+            className="w-full px-4 py-4 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 transition-shadow"
             required
           />
           <button
             type="submit"
-            disabled={submitting}
-            className="px-6 py-3 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+            disabled={submitting || submitSuccess}
+            className="w-full py-3.5 bg-blue-600 text-white rounded-xl text-sm font-semibold hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-all active:scale-[0.98]"
           >
-            {submitting ? "送信中..." : "確認する"}
+            {submitSuccess ? (
+              <span className="flex items-center justify-center gap-2">
+                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+                確認開始!
+              </span>
+            ) : submitting ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                確認を開始しています...
+              </span>
+            ) : (
+              "空室を確認する"
+            )}
           </button>
         </form>
-        {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
+        {error && (
+          <div className="mt-3 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
+            <p className="text-sm text-red-700">{error}</p>
+          </div>
+        )}
+        <div className="flex items-center gap-4 mt-4 pt-4 border-t border-gray-100">
+          <span className="text-xs text-gray-400">対応サイト:</span>
+          <span className="text-xs px-2 py-0.5 bg-green-50 text-green-700 rounded">SUUMO</span>
+          <span className="text-xs px-2 py-0.5 bg-orange-50 text-orange-700 rounded">HOMES</span>
+        </div>
       </section>
 
-      <section className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+      {/* 最近の確認結果 */}
+      <section className="bg-white rounded-2xl shadow-sm border border-gray-200 p-6">
         <h2 className="text-lg font-semibold text-gray-900 mb-4">
           最近の確認結果
         </h2>
-        {checks.length === 0 ? (
-          <p className="text-sm text-gray-400">まだ確認結果がありません</p>
+        {loading ? (
+          <div className="space-y-3">
+            {[...Array(5)].map((_, i) => (
+              <div key={i} className="flex items-center justify-between p-4 rounded-xl border border-gray-100">
+                <div className="skeleton h-4 w-48" />
+                <div className="skeleton h-6 w-16 rounded-full" />
+              </div>
+            ))}
+          </div>
+        ) : checks.length === 0 ? (
+          <div className="flex flex-col items-center justify-center py-12 text-center">
+            <div className="w-12 h-12 rounded-full bg-gray-100 flex items-center justify-center mb-3">
+              <svg className="w-6 h-6 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-5.197-5.197m0 0A7.5 7.5 0 105.196 5.196a7.5 7.5 0 0010.607 10.607z" />
+              </svg>
+            </div>
+            <p className="text-sm text-gray-400">まだ確認結果がありません</p>
+            <p className="text-xs text-gray-300 mt-1">上のフォームからURLを入力して確認を開始してください</p>
+          </div>
         ) : (
-          <div className="space-y-2">
-            {checks.map((item) => (
+          <div className="space-y-2" aria-live="polite">
+            {checks.map((item, index) => (
               <a
                 key={item.id}
                 href={`/check/${item.id}`}
-                className="flex items-center justify-between p-3 rounded-lg hover:bg-gray-50 border border-gray-100 transition-colors"
+                onClick={(e) => {
+                  e.preventDefault();
+                  router.push(`/check/${item.id}`);
+                }}
+                className="flex items-center justify-between p-4 rounded-xl hover:bg-gray-50 border border-gray-100 transition-all hover:border-gray-200 hover:shadow-sm group animate-fade-in"
+                style={{ animationDelay: `${index * 30}ms` }}
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-sm text-gray-900 truncate">
+                  <span className="text-sm text-gray-900 truncate font-medium">
                     {item.property_name || "(確認中)"}
                   </span>
                 </div>
@@ -130,14 +182,26 @@ export default function HomePage() {
                     </span>
                   ) : isTerminal(item.status) ? (
                     <span className="text-xs font-medium text-gray-500">
-                      {USER_STATUS_LABELS[item.status] || item.status}
+                      確認不可
                     </span>
                   ) : (
                     <span className="text-xs font-medium text-blue-500 flex items-center">
-                      <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse mr-1.5" />
+                      <span className="relative inline-flex h-2 w-2 mr-1.5">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                        <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+                      </span>
                       確認中...
                     </span>
                   )}
+                  <svg
+                    className="w-4 h-4 text-gray-300 group-hover:text-gray-400 transition-transform group-hover:translate-x-0.5"
+                    fill="none"
+                    viewBox="0 0 24 24"
+                    stroke="currentColor"
+                    strokeWidth={2}
+                  >
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  </svg>
                 </div>
               </a>
             ))}
@@ -147,3 +211,6 @@ export default function HomePage() {
     </div>
   );
 }
+
+// Import from constants
+import { getResultStyle } from "./lib/constants";

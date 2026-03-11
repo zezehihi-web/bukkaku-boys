@@ -16,8 +16,27 @@ export function usePolling(
 
   useEffect(() => {
     if (!enabled) return;
-    tick();
-    const id = setInterval(tick, intervalMs);
-    return () => clearInterval(id);
+
+    let id: ReturnType<typeof setInterval>;
+
+    const start = () => {
+      tick();
+      id = setInterval(tick, intervalMs);
+    };
+
+    const handleVisibility = () => {
+      clearInterval(id);
+      if (!document.hidden) {
+        start();
+      }
+    };
+
+    start();
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, [tick, intervalMs, enabled]);
 }

@@ -2,11 +2,12 @@
 
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend.config import ITANJI_EMAIL, ES_SQUARE_EMAIL, GOWEB_USER_ID
 from backend.credentials_map import parse_platform_key
 from backend.database import get_db
+from backend.middleware.auth import require_admin
 from backend.models import CheckRequest, CheckStatus, CheckListItem, PlatformSelection, PropertyInfoRequest
 from backend.services.vacancy_checker import run_vacancy_check
 from backend.services.url_parser import detect_portal
@@ -134,7 +135,7 @@ async def list_checks(limit: int = 50):
 
 
 @router.post("/check/{check_id}/platform")
-async def select_platform(check_id: int, sel: PlatformSelection):
+async def select_platform(check_id: int, sel: PlatformSelection, admin: str = Depends(require_admin)):
     """ユーザーがプラットフォームを手動選択"""
     # 単純キー "itanji" / 複合キー "bukkaku:CIC" 両対応
     platform_type, _ = parse_platform_key(sel.platform)
@@ -184,7 +185,7 @@ async def select_platform(check_id: int, sel: PlatformSelection):
 
 
 @router.get("/platforms/status")
-async def platform_status():
+async def platform_status(admin: str = Depends(require_admin)):
     """各プラットフォームの認証設定状態"""
     return {
         "itanji": {"configured": bool(ITANJI_EMAIL), "label": "イタンジBB"},

@@ -1,15 +1,16 @@
 """ナレッジDB管理APIルーター"""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend.database import get_db
+from backend.middleware.auth import require_admin
 from backend.models import KnowledgeEntry, KnowledgeItem
 
 router = APIRouter(tags=["knowledge"])
 
 
 @router.get("/knowledge", response_model=list[KnowledgeItem])
-async def list_knowledge():
+async def list_knowledge(admin: str = Depends(require_admin)):
     """ナレッジDB一覧"""
     db = await get_db()
     try:
@@ -34,7 +35,7 @@ async def list_knowledge():
 
 
 @router.post("/knowledge", response_model=KnowledgeItem)
-async def create_knowledge(entry: KnowledgeEntry):
+async def create_knowledge(entry: KnowledgeEntry, admin: str = Depends(require_admin)):
     """ナレッジDB登録"""
     if entry.platform not in ("itanji", "es_square"):
         raise HTTPException(status_code=400, detail="無効なプラットフォーム")
@@ -71,7 +72,7 @@ async def create_knowledge(entry: KnowledgeEntry):
 
 
 @router.put("/knowledge/{item_id}", response_model=KnowledgeItem)
-async def update_knowledge(item_id: int, entry: KnowledgeEntry):
+async def update_knowledge(item_id: int, entry: KnowledgeEntry, admin: str = Depends(require_admin)):
     """ナレッジDB更新"""
     if entry.platform not in ("itanji", "es_square"):
         raise HTTPException(status_code=400, detail="無効なプラットフォーム")
@@ -107,7 +108,7 @@ async def update_knowledge(item_id: int, entry: KnowledgeEntry):
 
 
 @router.delete("/knowledge/{item_id}")
-async def delete_knowledge(item_id: int):
+async def delete_knowledge(item_id: int, admin: str = Depends(require_admin)):
     """ナレッジDB削除"""
     db = await get_db()
     try:

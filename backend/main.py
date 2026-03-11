@@ -4,12 +4,13 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from backend.config import FRONTEND_URL
 from backend.database import init_db
+from backend.middleware.auth import require_admin
 from backend.routers import check, knowledge, phone_tasks
 from backend.services import playwright_loop, session_keeper, atbb_scheduler, r2_atbb_sync
 
@@ -73,6 +74,12 @@ app.include_router(phone_tasks.router, prefix="/api")
 async def test_page():
     """テストページを配信"""
     return FileResponse(TEST_HTML, media_type="text/html")
+
+
+@app.post("/api/auth/verify")
+async def verify_auth(admin: str = Depends(require_admin)):
+    """APIキーの有効性を検証"""
+    return {"valid": True}
 
 
 @app.get("/api/health")

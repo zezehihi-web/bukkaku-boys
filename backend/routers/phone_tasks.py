@@ -2,9 +2,10 @@
 
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from backend.database import get_db
+from backend.middleware.auth import require_admin
 from backend.models import PhoneTaskItem, PhoneTaskUpdate
 from backend.services.knowledge_service import mark_phone_required
 
@@ -12,7 +13,7 @@ router = APIRouter(tags=["phone_tasks"])
 
 
 @router.get("/phone-tasks", response_model=list[PhoneTaskItem])
-async def list_phone_tasks(status: str = ""):
+async def list_phone_tasks(status: str = "", admin: str = Depends(require_admin)):
     """電話確認タスク一覧"""
     db = await get_db()
     try:
@@ -31,7 +32,7 @@ async def list_phone_tasks(status: str = ""):
 
 
 @router.put("/phone-tasks/{task_id}")
-async def update_phone_task(task_id: int, update: PhoneTaskUpdate):
+async def update_phone_task(task_id: int, update: PhoneTaskUpdate, admin: str = Depends(require_admin)):
     """電話確認タスクを完了/キャンセル"""
     db = await get_db()
     try:
@@ -58,7 +59,7 @@ async def update_phone_task(task_id: int, update: PhoneTaskUpdate):
 
 
 @router.get("/phone-tasks/count")
-async def phone_tasks_count():
+async def phone_tasks_count(admin: str = Depends(require_admin)):
     """未完了の電話確認タスク数"""
     db = await get_db()
     try:
