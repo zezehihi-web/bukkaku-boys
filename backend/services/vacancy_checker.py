@@ -623,7 +623,7 @@ async def _notify(check_id: int, property_name: str, result: str, platform_name:
     # ユーザー向けLINEプッシュ通知（line_user_idが紐付いている場合）
     try:
         record = await _fetch_record(check_id)
-        if record and record.get("line_user_id"):
+        if record and record.get("line_user_id") and not record.get("line_notified"):
             await send_akishitsu_result(
                 record["line_user_id"], property_name, result, check_id
             )
@@ -631,5 +631,7 @@ async def _notify(check_id: int, property_name: str, result: str, platform_name:
             await set_akishitsu_conversation_state(
                 record["line_user_id"], check_id, property_name, result
             )
+            # 重複通知防止フラグを設定
+            await _update_status(check_id, line_notified=True)
     except Exception:
         pass

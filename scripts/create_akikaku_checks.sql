@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS akikaku_checks (
     error_message   TEXT DEFAULT '',
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     completed_at    TIMESTAMPTZ,
-    updated_at      TIMESTAMPTZ DEFAULT NOW()
+    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+    line_user_id    TEXT DEFAULT '',
+    line_notified   BOOLEAN DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_akikaku_checks_status ON akikaku_checks(status);
