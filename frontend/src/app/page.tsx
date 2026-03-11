@@ -7,9 +7,11 @@ import { isTerminal } from "./lib/constants";
 import type { CheckItem } from "./lib/types";
 import { usePolling } from "./lib/usePolling";
 
+const MAX_URLS = 5;
+
 export default function HomePage() {
   const router = useRouter();
-  const [urls, setUrls] = useState("");
+  const [urlFields, setUrlFields] = useState<string[]>([""]);
   const [submitting, setSubmitting] = useState(false);
   const [submitSuccess, setSubmitSuccess] = useState(false);
   const [checks, setChecks] = useState<CheckItem[]>([]);
@@ -31,38 +33,48 @@ export default function HomePage() {
 
   usePolling(fetchChecks, 5000);
 
-  /** textarea内容をURL配列に変換（空行除去） */
-  const parseUrls = (input: string): string[] => {
-    return input
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
+  const updateUrl = (index: number, value: string) => {
+    setUrlFields((prev) => {
+      const next = [...prev];
+      next[index] = value;
+      return next;
+    });
   };
 
-  /** URL配列を検証。エラーがあれば文字列を返す */
+  const addField = () => {
+    if (urlFields.length < MAX_URLS) {
+      setUrlFields((prev) => [...prev, ""]);
+    }
+  };
+
+  const removeField = (index: number) => {
+    if (urlFields.length <= 1) return;
+    setUrlFields((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  /** 入力済みURL（空欄除去） */
+  const filledUrls = urlFields.map((u) => u.trim()).filter((u) => u.length > 0);
+
+  /** URL配列を検証 */
   const validateUrls = (urlList: string[]): string | null => {
     if (urlList.length === 0) return "URLを入力してください";
-    if (urlList.length > 5) return "一度に確認できるのは最大5件です";
     const errors: string[] = [];
     urlList.forEach((u, i) => {
       try {
         new URL(u);
       } catch {
-        errors.push(`${i + 1}行目: 有効なURLではありません`);
+        errors.push(`${i + 1}件目: 有効なURLではありません`);
       }
     });
     if (errors.length > 0) return errors.join("\n");
     return null;
   };
 
-  const urlCount = parseUrls(urls).length;
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
 
-    const urlList = parseUrls(urls);
-    const validationError = validateUrls(urlList);
+    const validationError = validateUrls(filledUrls);
     if (validationError) {
       setError(validationError);
       return;
@@ -70,36 +82,34 @@ export default function HomePage() {
 
     setSubmitting(true);
     try {
-      if (urlList.length === 1) {
-        // 1件の場合: 従来通り個別API
+      if (filledUrls.length === 1) {
         const res = await fetch(`${API_BASE}/api/check`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: urlList[0] }),
+          body: JSON.stringify({ url: filledUrls[0] }),
         });
         if (!res.ok) {
           const data = await res.json();
           throw new Error(data.detail || "送信に失敗しました");
         }
         const data = await res.json();
-        setUrls("");
+        setUrlFields([""]);
         setSubmitSuccess(true);
         setTimeout(() => {
           router.push(`/check/${data.id}`);
         }, 300);
       } else {
-        // 複数件: バッチAPI
         const res = await fetch(`${API_BASE}/api/checks/batch`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ urls: urlList }),
+          body: JSON.stringify({ urls: filledUrls }),
         });
         if (!res.ok) {
           const data = await res.json();
           throw new Error(data.detail || "送信に失敗しました");
         }
         const data = await res.json();
-        setUrls("");
+        setUrlFields([""]);
         setSubmitSuccess(true);
         setTimeout(() => {
           router.push(`/batch?ids=${data.ids.join(",")}`);
@@ -118,29 +128,51 @@ export default function HomePage() {
       <section className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
         <h2 className="text-xl font-bold text-gray-900 mb-2">空室確認</h2>
         <p className="text-sm text-gray-500 mb-6">
-          SUUMOまたはHOMESの物件ページURLを貼り付けてください（最大5件）
+          SUUMOまたはHOMESの物件ページURLを貼り付けてください（最大{MAX_URLS}件）
         </p>
         <form onSubmit={handleSubmit} className="space-y-3">
-          <div className="relative">
-            <textarea
-              value={urls}
-              onChange={(e) => setUrls(e.target.value)}
-              placeholder={"https://suumo.jp/...\nhttps://www.homes.co.jp/...\n（1行に1件、最大5件まで）"}
-              rows={4}
-              className="w-full px-4 py-4 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 transition-shadow resize-none"
-            />
-            {urlCount > 0 && (
-              <span
-                className={`absolute bottom-3 right-3 text-xs font-medium px-2 py-0.5 rounded-full ${
-                  urlCount > 5
-                    ? "bg-red-100 text-red-600"
-                    : "bg-blue-100 text-blue-600"
-                }`}
-              >
-                {urlCount}/5 件
-              </span>
-            )}
+          <div className="space-y-2">
+            {urlFields.map((url, index) => (
+              <div key={index} className="flex items-center gap-2">
+                <span className="text-xs text-gray-400 font-mono w-5 shrink-0 text-right">
+                  {index + 1}.
+                </span>
+                <input
+                  type="url"
+                  value={url}
+                  onChange={(e) => updateUrl(index, e.target.value)}
+                  placeholder="https://suumo.jp/... または https://www.homes.co.jp/..."
+                  className="flex-1 px-4 py-3 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 transition-shadow"
+                />
+                {urlFields.length > 1 && (
+                  <button
+                    type="button"
+                    onClick={() => removeField(index)}
+                    className="p-2 text-gray-300 hover:text-red-500 transition-colors shrink-0"
+                    title="削除"
+                  >
+                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
+
+          {urlFields.length < MAX_URLS && (
+            <button
+              type="button"
+              onClick={addField}
+              className="flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-800 font-medium px-1 py-1 transition-colors"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              </svg>
+              URLを追加（{urlFields.length}/{MAX_URLS}）
+            </button>
+          )}
+
           <button
             type="submit"
             disabled={submitting || submitSuccess}
@@ -158,8 +190,8 @@ export default function HomePage() {
                 <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 確認を開始しています...
               </span>
-            ) : urlCount > 1 ? (
-              `${urlCount}件の空室を一括確認する`
+            ) : filledUrls.length > 1 ? (
+              `${filledUrls.length}件の空室を一括確認する`
             ) : (
               "空室を確認する"
             )}
