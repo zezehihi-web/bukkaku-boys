@@ -153,23 +153,17 @@ async def send_akishitsu_result(
                         "weight": "bold",
                         "size": "md",
                         "wrap": True,
-                        "maxLines": 2,
                     },
                     {"type": "separator", "margin": "md"},
                     {
-                        "type": "box",
-                        "layout": "horizontal",
+                        "type": "text",
+                        "text": f"{emoji} {vacancy_result}",
+                        "weight": "bold",
+                        "size": "lg",
+                        "color": color,
+                        "align": "center",
+                        "wrap": True,
                         "margin": "lg",
-                        "contents": [
-                            {
-                                "type": "text",
-                                "text": f"{emoji} {vacancy_result}",
-                                "weight": "bold",
-                                "size": "xl",
-                                "color": color,
-                                "align": "center",
-                            }
-                        ],
                     },
                 ],
                 "paddingAll": "14px",
@@ -218,45 +212,56 @@ async def set_akishitsu_conversation_state(
     property_name: str,
     vacancy_result: str,
 ):
-    """空確くんの会話状態をKVに設定（Next.js側のWebhookで使用）
+    """空確くんの会話状態をNeon PostgreSQLに設定（Next.js側のWebhookで使用）
 
-    Python backend から KV (Upstash) に直接書き込み、
+    Python backend から Neon DB (line_conversation_states テーブル) に直接書き込み、
     Webhook ハンドラーがボタン押下時に参照できるようにする。
     """
     import os
-    rest_url = os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("KV_REST_API_URL")
-    rest_token = os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("KV_REST_API_TOKEN")
+    from urllib.parse import urlparse
 
-    if not rest_url or not rest_token:
-        log.warning("KV credentials not available, skipping conversation state set")
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        log.warning("DATABASE_URL not set, skipping conversation state set")
         return
 
     # 電話確認の場合は会話状態を設定しない
     if vacancy_result.startswith("電話確認"):
         return
 
-    import json
-    from datetime import datetime
+    # Parse DATABASE_URL to get Neon HTTP endpoint
+    parsed = urlparse(database_url)
+    neon_host = parsed.hostname
+    http_url = f"https://{neon_host}/sql"
 
-    state = json.dumps({
-        "line_user_id": line_user_id,
-        "step": "akishitsu_next_step",
-        "case_id": f"akishitsu_{check_id}",
-        "updated_at": datetime.utcnow().isoformat() + "Z",
-        "source": "akishitsu",
-        "akishitsu_check_id": check_id,
-        "akishitsu_property_name": property_name,
-    })
+    query = (
+        "INSERT INTO line_conversation_states "
+        "(line_user_id, step, case_id, source, akishitsu_check_id, akishitsu_property_name, updated_at) "
+        "VALUES ($1, $2, $3, $4, $5, $6, NOW()) "
+        "ON CONFLICT (line_user_id) DO UPDATE SET "
+        "step = EXCLUDED.step, case_id = EXCLUDED.case_id, source = EXCLUDED.source, "
+        "akishitsu_check_id = EXCLUDED.akishitsu_check_id, "
+        "akishitsu_property_name = EXCLUDED.akishitsu_property_name, "
+        "updated_at = NOW()"
+    )
+    params = [
+        line_user_id,
+        "akishitsu_next_step",
+        f"akishitsu_{check_id}",
+        "akishitsu",
+        check_id,
+        property_name,
+    ]
 
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
-                rest_url,
+                http_url,
                 headers={
                     "Content-Type": "application/json",
-                    "Authorization": f"Bearer {rest_token}",
+                    "Neon-Connection-String": database_url,
                 },
-                json=["SET", f"conversation:{line_user_id}", state],
+                json={"query": query, "params": params},
                 timeout=5.0,
             )
             resp.raise_for_status()

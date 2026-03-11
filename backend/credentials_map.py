@@ -512,10 +512,16 @@ def lookup_credentials(company_name: str) -> tuple[str, str, str, str] | None:
     if not company_name:
         return None
 
+    # 未実装プラットフォーム
+    _UNIMPLEMENTED = {"kimaroom", "skips", "dkpartners"}
+
     normalized = _normalize(company_name)
 
     for key, platform, cred_key in COMPANY_MAP:
         if _normalize(key) in normalized:
+            # 未実装プラットフォームの場合はスキップしてフォールバックへ
+            if platform in _UNIMPLEMENTED:
+                break
             # シングルテナント（itanji/es_square）は環境変数チェック不要
             if not cred_key:
                 return (platform, "", "", "")
@@ -549,10 +555,16 @@ def get_platform_key(company_name: str) -> str | None:
     if not company_name:
         return None
 
+    # 未実装プラットフォーム（COMPANY_MAPにはあるが実装されていない）
+    _UNIMPLEMENTED_PLATFORMS = {"kimaroom", "skips", "dkpartners"}
+
     normalized = _normalize(company_name)
 
     for key, platform, cred_key in COMPANY_MAP:
         if _normalize(key) in normalized:
+            # 未実装プラットフォームの場合はスキップしてフォールバックへ
+            if platform in _UNIMPLEMENTED_PLATFORMS:
+                break
             # シングルテナント（itanji/es_square）は単純キーを返す
             if not cred_key:
                 return platform

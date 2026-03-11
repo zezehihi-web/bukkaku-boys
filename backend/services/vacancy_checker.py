@@ -374,7 +374,37 @@ async def _step_match(
         )
         await _step_check(check_id)
     else:
-        await _update_status(check_id, status="awaiting_platform", platform="", platform_auto=False)
+        # プラットフォーム不明 → イタンジBB/e生活スクエアでフォールバック検索
+        print(f"[空確] プラットフォーム不明: {company_name} → フォールバック検索")
+        # 号室分離
+        fb_room = ""
+        if "/" in property_name:
+            fb_parts = property_name.rsplit("/", 1)
+            fb_name = fb_parts[0].strip()
+            fb_room = fb_parts[1].strip()
+        else:
+            import re as _re
+            m = _re.search(r'\s+(\d{1,4})\s*号?室?\s*$', property_name)
+            if m:
+                fb_room = m.group(1)
+                fb_name = property_name[:m.start()].strip()
+            else:
+                fb_name = property_name
+
+        fb_result = await _fallback_search(fb_name, fb_room, address)
+        if fb_result != "該当なし":
+            await _update_status(
+                check_id,
+                platform="fallback",
+                platform_auto=True,
+                status="done",
+                vacancy_result=fb_result,
+                completed_at=datetime.now().isoformat(),
+            )
+            await _notify(check_id, property_name, fb_result, "フォールバック検索")
+        else:
+            # フォールバックでも見つからない → awaiting_platform
+            await _update_status(check_id, status="awaiting_platform", platform="", platform_auto=False)
 
 
 async def _step_check_direct(check_id: int, detail_url: str, platform: str, room_number: str = ""):
@@ -441,6 +471,38 @@ async def _step_check_direct(check_id: int, detail_url: str, platform: str, room
     await _notify(check_id, property_name, result, platform_names.get(platform, platform))
 
 
+async def _fallback_search(property_name: str, room_number: str, address: str = "") -> str:
+    """未実装プラットフォーム・不明な管理会社の場合のフォールバック検索
+
+    イタンジBB → e生活スクエア の順に物件名で検索し、
+    ヒットすればその結果を返す。見つからなければ "該当なし" を返す。
+    """
+    # イタンジBBで検索
+    try:
+        async with platform_lock("itanji"):
+            await _rate_limit("itanji")
+            result = await itanji_check(property_name, room_number)
+        if result != "該当なし":
+            print(f"[空確] フォールバック: イタンジBBでヒット → {result}")
+            return result
+    except Exception as e:
+        print(f"[空確] フォールバック: イタンジBB検索エラー: {e}")
+
+    # e生活スクエアで検索
+    try:
+        async with platform_lock("es_square"):
+            await _rate_limit("es_square")
+            result = await es_square_check(property_name, room_number, address)
+        if result != "該当なし":
+            print(f"[空確] フォールバック: e生活スクエアでヒット → {result}")
+            return result
+    except Exception as e:
+        print(f"[空確] フォールバック: e生活スクエア検索エラー: {e}")
+
+    print(f"[空確] フォールバック: イタンジBB/e生活スクエアともに該当なし: {property_name}")
+    return "該当なし"
+
+
 async def _step_check(check_id: int):
     """ステップ4: 空室確認（従来のプラットフォーム検索方式）"""
     record = await _fetch_record(check_id)
@@ -490,11 +552,13 @@ async def _step_check(check_id: int):
             elif platform_type == "realpro":
                 result = await realpro_check(property_name, room_number)
             elif platform_type in ("dkpartners", "skips", "kimaroom"):
-                # 未実装プラットフォーム → 電話確認にフォールバック
-                print(f"[空確] {platform_type}チェッカー未実装: {property_name} → 電話確認")
-                result = "該当なし"
+                # 未実装プラットフォーム → イタンジBB/e生活スクエアでフォールバック検索
+                print(f"[空確] {platform_type}チェッカー未実装: {property_name} → イタンジBB/e生活スクエアでフォールバック検索")
+                result = await _fallback_search(property_name, room_number, property_address)
             else:
-                result = "該当なし"
+                # 不明なプラットフォーム → フォールバック検索
+                print(f"[空確] 不明なプラットフォーム {platform_type}: {property_name} → フォールバック検索")
+                result = await _fallback_search(property_name, room_number, property_address)
     except Exception as e:
         # プラットフォームで確認できなかった → 電話確認タスクに振り分け
         err_detail = f"{type(e).__name__}: {e}"
