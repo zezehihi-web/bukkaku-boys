@@ -53,7 +53,7 @@ _COLUMNS = [
     "atbb_matched", "atbb_company", "platform", "platform_auto",
     "status", "vacancy_result", "error_message",
     "created_at", "completed_at", "updated_at",
-    "line_user_id",
+    "line_user_id", "line_notified", "batch_group",
 ]
 
 

@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS akikaku_checks (
     completed_at    TIMESTAMPTZ,
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
     line_user_id    TEXT DEFAULT '',
-    line_notified   BOOLEAN DEFAULT FALSE
+    line_notified   BOOLEAN DEFAULT FALSE,
+    batch_group     TEXT DEFAULT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_akikaku_checks_status ON akikaku_checks(status);

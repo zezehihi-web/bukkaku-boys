@@ -267,7 +267,23 @@ async def _step_match(
                 print(f"[空確] R2直接確認失敗（ATBB不一致ケース）: {e}")
                 # R2も失敗 → 確認不可
 
-        # ATBBもR2もダメ → 確認不可
+        # ATBBもR2もダメ → イタンジBB/e生活スクエアでフォールバック検索
+        print(f"[空確] ATBB不一致・R2なし → フォールバック検索: {original_name} {original_room}")
+        fb_result = await _fallback_search(original_name, original_room, address)
+        if fb_result != "該当なし":
+            await _update_status(
+                check_id,
+                atbb_matched=False,
+                platform="fallback",
+                platform_auto=True,
+                status="done",
+                vacancy_result=fb_result,
+                completed_at=datetime.now().isoformat(),
+            )
+            await _notify(check_id, property_name, fb_result, "")
+            return
+
+        # フォールバックでも該当なし → 確認不可
         await _update_status(
             check_id,
             atbb_matched=False,
@@ -688,14 +704,112 @@ async def _notify(check_id: int, property_name: str, result: str, platform_name:
     try:
         record = await _fetch_record(check_id)
         if record and record.get("line_user_id") and not record.get("line_notified"):
-            await send_akishitsu_result(
-                record["line_user_id"], property_name, result, check_id
-            )
-            # 会話状態を設定（Webhookでボタン押下を処理するため）
-            await set_akishitsu_conversation_state(
-                record["line_user_id"], check_id, property_name, result
-            )
-            # 重複通知防止フラグを設定
-            await _update_status(check_id, line_notified=True)
+            batch_group = record.get("batch_group")
+            if batch_group:
+                # バッチの場合: 全件完了したらまとめて通知
+                await _try_batch_notify(batch_group, record["line_user_id"])
+            else:
+                # 単件の場合: 従来通り個別通知
+                await send_akishitsu_result(
+                    record["line_user_id"], property_name, result, check_id
+                )
+                await set_akishitsu_conversation_state(
+                    record["line_user_id"], check_id, property_name, result
+                )
+                await _update_status(check_id, line_notified=True)
     except Exception:
         pass
+
+
+async def _try_batch_notify(batch_group: str, line_user_id: str):
+    """バッチグループの全件が完了したかチェックし、完了していればまとめて通知"""
+    from backend.notifications.line_notifier import send_akishitsu_batch_result
+
+    try:
+        # Neon DBからバッチグループの全レコードを取得
+        import os
+        from urllib.parse import urlparse
+
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            return
+
+        parsed = urlparse(database_url)
+        neon_host = parsed.hostname
+        http_url = f"https://{neon_host}/sql"
+
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                http_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Neon-Connection-String": database_url,
+                },
+                json={
+                    "query": "SELECT id, property_name, status, vacancy_result, line_notified FROM akikaku_checks WHERE batch_group = $1 ORDER BY id",
+                    "params": [batch_group],
+                },
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+        rows = data.get("rows", [])
+        fields = [f["name"] for f in data.get("fields", [])]
+
+        # 全件ターミナルかチェック
+        terminal_statuses = {"done", "not_found", "error"}
+        all_done = all(
+            rows[i][fields.index("status")] in terminal_statuses
+            for i in range(len(rows))
+        )
+
+        if not all_done:
+            return  # まだ未完了の件がある
+
+        # 既にバッチ通知済みかチェック（1件でもline_notified=trueなら送信済み）
+        any_notified = any(
+            rows[i][fields.index("line_notified")] for i in range(len(rows))
+        )
+        if any_notified:
+            return
+
+        # まとめて通知
+        results = []
+        for row in rows:
+            results.append({
+                "check_id": row[fields.index("id")],
+                "property_name": row[fields.index("property_name")] or "物件",
+                "vacancy_result": row[fields.index("vacancy_result")] or "確認不可",
+            })
+
+        await send_akishitsu_batch_result(line_user_id, results)
+
+        # 全件のline_notifiedフラグを設定
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                http_url,
+                headers={
+                    "Content-Type": "application/json",
+                    "Neon-Connection-String": database_url,
+                },
+                json={
+                    "query": "UPDATE akikaku_checks SET line_notified = true, updated_at = NOW() WHERE batch_group = $1",
+                    "params": [batch_group],
+                },
+                timeout=5.0,
+            )
+
+        # 会話状態は募集中物件の最初のIDで設定
+        available = [r for r in results if r["vacancy_result"].startswith("募集中")]
+        if available:
+            await set_akishitsu_conversation_state(
+                line_user_id,
+                available[0]["check_id"],
+                available[0]["property_name"],
+                available[0]["vacancy_result"],
+            )
+
+    except Exception as e:
+        print(f"[空確] バッチ通知エラー: {e}")
