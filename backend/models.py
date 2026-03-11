@@ -20,6 +20,16 @@ class PropertyInfoRequest(BaseModel):
     build_year: str = ""
 
 
+class BatchCheckRequest(BaseModel):
+    """一括空室確認リクエスト（最大5件）"""
+    urls: list[str]
+
+
+class BatchCheckResponse(BaseModel):
+    """一括空室確認レスポンス"""
+    ids: list[int]
+
+
 class PlatformSelection(BaseModel):
     """プラットフォーム選択（ユーザー手動）"""
     platform: str  # 'itanji' / 'es_square'

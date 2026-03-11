@@ -51,6 +51,10 @@ export type PhoneTask = {
   completed_at: string | null;
 };
 
+export type BatchCheckResponse = {
+  ids: number[];
+};
+
 export type PlatformStatus = Record<
   string,
   { configured: boolean; label: string }

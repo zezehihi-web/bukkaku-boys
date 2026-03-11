@@ -8,7 +8,7 @@ from backend.config import ITANJI_EMAIL, ES_SQUARE_EMAIL, GOWEB_USER_ID
 from backend.credentials_map import parse_platform_key
 from backend.database import get_db
 from backend.middleware.auth import require_admin
-from backend.models import CheckRequest, CheckStatus, CheckListItem, PlatformSelection, PropertyInfoRequest
+from backend.models import CheckRequest, CheckStatus, CheckListItem, PlatformSelection, PropertyInfoRequest, BatchCheckRequest, BatchCheckResponse
 from backend.services.vacancy_checker import run_vacancy_check
 from backend.services.url_parser import detect_portal
 
@@ -90,6 +90,37 @@ async def create_check_from_property_info(req: PropertyInfoRequest):
     ))
 
     return _row_to_status(record)
+
+
+@router.post("/checks/batch", response_model=BatchCheckResponse)
+async def create_batch_check(req: BatchCheckRequest):
+    """一括空室確認（最大5件のURLを同時に受付、順次処理）"""
+    urls = [u.strip() for u in req.urls if u.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="URLが空です")
+    if len(urls) > 5:
+        raise HTTPException(status_code=400, detail="一度に確認できるのは最大5件です")
+
+    ids: list[int] = []
+    db = await get_db()
+    try:
+        for url in urls:
+            portal = detect_portal(url) or ""
+            cursor = await db.execute(
+                """INSERT INTO check_requests (submitted_url, portal_source, status)
+                   VALUES (?, ?, 'pending')""",
+                (url, portal),
+            )
+            ids.append(cursor.lastrowid)
+        await db.commit()
+    finally:
+        await db.close()
+
+    # 全件登録後にバックグラウンド処理を開始
+    for row_id in ids:
+        _start_background_check(row_id)
+
+    return BatchCheckResponse(ids=ids)
 
 
 @router.get("/check/{check_id}", response_model=CheckStatus)

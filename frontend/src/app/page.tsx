@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { API_BASE } from "./lib/api";
 import { isTerminal } from "./lib/constants";
@@ -9,7 +9,7 @@ import { usePolling } from "./lib/usePolling";
 
 export default function HomePage() {
   const router = useRouter();
-  const [url, setUrl] = useState("");
+  const [urls, setUrls] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitSuccess, setSubmitSuccess] = useState(false);
   const [checks, setChecks] = useState<CheckItem[]>([]);
@@ -31,22 +31,38 @@ export default function HomePage() {
 
   usePolling(fetchChecks, 5000);
 
-  const validateUrl = (input: string): string | null => {
-    const trimmed = input.trim();
-    if (!trimmed) return "URLを入力してください";
-    try {
-      new URL(trimmed);
-      return null;
-    } catch {
-      return "有効なURLを入力してください";
-    }
+  /** textarea内容をURL配列に変換（空行除去） */
+  const parseUrls = (input: string): string[] => {
+    return input
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
   };
+
+  /** URL配列を検証。エラーがあれば文字列を返す */
+  const validateUrls = (urlList: string[]): string | null => {
+    if (urlList.length === 0) return "URLを入力してください";
+    if (urlList.length > 5) return "一度に確認できるのは最大5件です";
+    const errors: string[] = [];
+    urlList.forEach((u, i) => {
+      try {
+        new URL(u);
+      } catch {
+        errors.push(`${i + 1}行目: 有効なURLではありません`);
+      }
+    });
+    if (errors.length > 0) return errors.join("\n");
+    return null;
+  };
+
+  const urlCount = parseUrls(urls).length;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
 
-    const validationError = validateUrl(url);
+    const urlList = parseUrls(urls);
+    const validationError = validateUrls(urlList);
     if (validationError) {
       setError(validationError);
       return;
@@ -54,21 +70,41 @@ export default function HomePage() {
 
     setSubmitting(true);
     try {
-      const res = await fetch(`${API_BASE}/api/check`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: url.trim() }),
-      });
-      if (!res.ok) {
+      if (urlList.length === 1) {
+        // 1件の場合: 従来通り個別API
+        const res = await fetch(`${API_BASE}/api/check`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: urlList[0] }),
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.detail || "送信に失敗しました");
+        }
         const data = await res.json();
-        throw new Error(data.detail || "送信に失敗しました");
+        setUrls("");
+        setSubmitSuccess(true);
+        setTimeout(() => {
+          router.push(`/check/${data.id}`);
+        }, 300);
+      } else {
+        // 複数件: バッチAPI
+        const res = await fetch(`${API_BASE}/api/checks/batch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ urls: urlList }),
+        });
+        if (!res.ok) {
+          const data = await res.json();
+          throw new Error(data.detail || "送信に失敗しました");
+        }
+        const data = await res.json();
+        setUrls("");
+        setSubmitSuccess(true);
+        setTimeout(() => {
+          router.push(`/batch?ids=${data.ids.join(",")}`);
+        }, 300);
       }
-      const data = await res.json();
-      setUrl("");
-      setSubmitSuccess(true);
-      setTimeout(() => {
-        router.push(`/check/${data.id}`);
-      }, 300);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : "エラーが発生しました");
     } finally {
@@ -82,17 +118,29 @@ export default function HomePage() {
       <section className="bg-white rounded-2xl shadow-sm border border-gray-200 p-8">
         <h2 className="text-xl font-bold text-gray-900 mb-2">空室確認</h2>
         <p className="text-sm text-gray-500 mb-6">
-          SUUMOまたはHOMESの物件ページURLを貼り付けてください
+          SUUMOまたはHOMESの物件ページURLを貼り付けてください（最大5件）
         </p>
         <form onSubmit={handleSubmit} className="space-y-3">
-          <input
-            type="url"
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://suumo.jp/... または https://www.homes.co.jp/..."
-            className="w-full px-4 py-4 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 transition-shadow"
-            required
-          />
+          <div className="relative">
+            <textarea
+              value={urls}
+              onChange={(e) => setUrls(e.target.value)}
+              placeholder={"https://suumo.jp/...\nhttps://www.homes.co.jp/...\n（1行に1件、最大5件まで）"}
+              rows={4}
+              className="w-full px-4 py-4 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent placeholder:text-gray-400 transition-shadow resize-none"
+            />
+            {urlCount > 0 && (
+              <span
+                className={`absolute bottom-3 right-3 text-xs font-medium px-2 py-0.5 rounded-full ${
+                  urlCount > 5
+                    ? "bg-red-100 text-red-600"
+                    : "bg-blue-100 text-blue-600"
+                }`}
+              >
+                {urlCount}/5 件
+              </span>
+            )}
+          </div>
           <button
             type="submit"
             disabled={submitting || submitSuccess}
@@ -110,6 +158,8 @@ export default function HomePage() {
                 <span className="inline-block w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                 確認を開始しています...
               </span>
+            ) : urlCount > 1 ? (
+              `${urlCount}件の空室を一括確認する`
             ) : (
               "空室を確認する"
             )}
@@ -117,7 +167,7 @@ export default function HomePage() {
         </form>
         {error && (
           <div className="mt-3 bg-red-50 border border-red-200 rounded-lg px-4 py-3">
-            <p className="text-sm text-red-700">{error}</p>
+            <p className="text-sm text-red-700 whitespace-pre-line">{error}</p>
           </div>
         )}
         <div className="flex items-center gap-4 mt-4 pt-4 border-t border-gray-100">
