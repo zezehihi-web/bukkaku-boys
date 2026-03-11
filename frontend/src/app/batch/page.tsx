@@ -1,12 +1,12 @@
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { Suspense, useState, useEffect, useCallback, useRef } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { API_BASE } from "../lib/api";
 import { isTerminal, getResultStyle } from "../lib/constants";
 import type { CheckStatus } from "../lib/types";
 
-export default function BatchPage() {
+function BatchContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const [checks, setChecks] = useState<Map<number, CheckStatus>>(new Map());
@@ -17,6 +17,8 @@ export default function BatchPage() {
     .split(",")
     .map((s) => parseInt(s, 10))
     .filter((n) => !isNaN(n));
+
+  const idsKey = ids.join(",");
 
   const fetchAll = useCallback(async () => {
     const results = await Promise.allSettled(
@@ -36,7 +38,7 @@ export default function BatchPage() {
       return next;
     });
     setLoading(false);
-  }, [ids.join(",")]);
+  }, [idsKey]);
 
   useEffect(() => {
     if (ids.length === 0) return;
@@ -45,7 +47,7 @@ export default function BatchPage() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [ids.join(",")]);
+  }, [idsKey]);
 
   // 全件ターミナルならポーリング停止
   useEffect(() => {
@@ -59,7 +61,7 @@ export default function BatchPage() {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
-  }, [checks, ids.join(",")]);
+  }, [checks, idsKey]);
 
   const completedCount = ids.filter((id) => {
     const c = checks.get(id);
@@ -185,5 +187,19 @@ export default function BatchPage() {
         )}
       </section>
     </div>
+  );
+}
+
+export default function BatchPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="text-center py-16">
+          <span className="inline-block w-6 h-6 border-2 border-gray-300 border-t-blue-500 rounded-full animate-spin" />
+        </div>
+      }
+    >
+      <BatchContent />
+    </Suspense>
   );
 }
