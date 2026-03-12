@@ -312,7 +312,7 @@ async def match_property(
 
             # 物件名が空の場合はより厳格な検証を要求
             if not target_name:
-                # 物件名なし: 築年数による追加検証を必須とする
+                # 築年数がある場合: 住所+面積+築年数の3条件で照合
                 if target_build_year is not None:
                     verified = []
                     for row, area_diff in area_matches:
@@ -324,7 +324,10 @@ async def match_property(
                     elif len(verified) > 1:
                         verified.sort(key=lambda x: x[1])
                         return _row_to_dict(verified[0][0])
-                # 物件名なし+築年数なし → 戦略2ではマッチさせない（誤マッチ防止）
+                # 築年数なしでも、区チェック済み+候補1件のみなら確定
+                # (同じ区・同じ丁目・面積±1㎡で1件しかなければ、ほぼ同一物件)
+                elif len(area_matches) == 1 and target_ward:
+                    return _row_to_dict(area_matches[0][0])
             else:
                 # 物件名ありの場合は従来ロジック
                 if len(area_matches) == 1:

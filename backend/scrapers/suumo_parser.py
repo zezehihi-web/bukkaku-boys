@@ -25,10 +25,13 @@ SUUMOの物件詳細ページから物件名・住所・賃料・面積・間取
 
 import re
 import asyncio
+import logging
 import subprocess
 from urllib.parse import urlparse, parse_qs
 import httpx
 from bs4 import BeautifulSoup
+
+logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -125,45 +128,7 @@ async def parse_suumo_url(url: str) -> dict:
     html_bytes = await _fetch_html_bytes(fetch_url)
     soup = BeautifulSoup(html_bytes, "lxml", from_encoding="utf-8")
 
-    # --- 物件名 ---
-    h1 = soup.select_one("h1.section_h1-header-title")
-    room_from_h1 = ""
-    if h1:
-        h1_text = h1.get_text(strip=True)
-        # 「路線 駅 N階建 築N年」パターンは物件名ではない (jnc_ページ)
-        if not re.match(r".*駅\s+\d+階建\s+築\d+年$", h1_text):
-            # bc_ページ: 「物件名 4F号室 - 不動産会社が提供する賃貸物件情報」を清掃
-            # ※ ー（長音符）を含めると物件名中のカタカナ長音にマッチするため除外
-            name = re.sub(r'\s+[-\-–—]\s+.+(?:提供|が提供する).+$', '', h1_text)
-            # 号室番号を抽出してから除去
-            room_m = re.search(r'\s+(\d+F?号室)$', name)
-            if room_m:
-                room_from_h1 = re.sub(r'[F号室]', '', room_m.group(1))
-                name = name[:room_m.start()]
-            result["property_name"] = _clean_parsed_name(name)
-
-    # --- library ページのフォールバック ---
-    # jnc_ が /library/ にリダイレクトされた場合、h1にクラスがなく
-    # 「物件名の賃貸物件情報」形式になっている
-    if not result["property_name"]:
-        # og:title から抽出: 「物件名の賃貸物件・価格情報【SUUMO】」
-        og = soup.find("meta", {"property": "og:title"})
-        if og and og.get("content"):
-            og_text = og["content"]
-            # 「XXXの賃貸物件・価格情報【SUUMO】」→ XXX を抽出
-            m = re.match(r'^(.+?)の賃貸物件', og_text)
-            if m:
-                result["property_name"] = _clean_parsed_name(m.group(1))
-        # og:title が無い場合、h1（クラス無し）から抽出
-        if not result["property_name"]:
-            h1_plain = soup.find("h1")
-            if h1_plain:
-                h1_text = h1_plain.get_text(strip=True)
-                m = re.match(r'^(.+?)の賃貸物件情報$', h1_text)
-                if m:
-                    result["property_name"] = _clean_parsed_name(m.group(1))
-
-    # --- データ収集（複数ソースから統合） ---
+    # --- データ収集（複数ソースから統合。物件名フォールバックでも使うため先に実行） ---
     table_data = {}
 
     # 1) th/td テーブル（jnc_ / bc_ 共通）
@@ -191,6 +156,103 @@ async def parse_suumo_url(url: str) -> dict:
             val = body_el.get_text(strip=True)
             if label not in table_data:
                 table_data[label] = val
+
+    # --- 物件名 ---
+    h1 = soup.select_one("h1.section_h1-header-title")
+    room_from_h1 = ""
+    if h1:
+        h1_text = h1.get_text(strip=True)
+        # 「路線 駅 N階建 築N年」パターンは物件名ではない (jnc_ページ)
+        if not re.match(r".*駅\s+\d+階建\s+築\d+年$", h1_text):
+            # bc_ページ: 「物件名 4F号室 - 不動産会社が提供する賃貸物件情報」を清掃
+            # ※ ー（長音符）を含めると物件名中のカタカナ長音にマッチするため除外
+            name = re.sub(r'\s+[-\-–—]\s+.+(?:提供|が提供する).+$', '', h1_text)
+            # 号室番号を抽出してから除去
+            room_m = re.search(r'\s+(\d+F?号室)$', name)
+            if room_m:
+                room_from_h1 = re.sub(r'[F号室]', '', room_m.group(1))
+                name = name[:room_m.start()]
+            result["property_name"] = _clean_parsed_name(name)
+
+    # --- library ページのフォールバック ---
+    # jnc_ が /library/ にリダイレクトされた場合、h1にクラスがなく
+    # 「物件名の賃貸物件情報」形式になっている
+    if not result["property_name"]:
+        # og:title から抽出:
+        # パターン1: 「物件名の賃貸物件・価格情報【SUUMO】」
+        # パターン2: 「物件名/東京都港区の物件情報【SUUMO】」
+        og = soup.find("meta", {"property": "og:title"})
+        if og and og.get("content"):
+            og_text = og["content"]
+            for og_pat in [
+                r'^(.+?)/[^/]+の物件情報',   # 「物件名/地域の物件情報【SUUMO】」
+                r'^(.+?)の賃貸物件',           # 「物件名の賃貸物件・価格情報【SUUMO】」
+                r'^(.+?)の物件情報',           # 「物件名の物件情報【SUUMO】」
+            ]:
+                m = re.match(og_pat, og_text)
+                if m:
+                    name = _clean_parsed_name(m.group(1))
+                    if name and len(name) > 1:
+                        result["property_name"] = name
+                        break
+        # og:title が無い場合、h1（クラス無し）から抽出
+        if not result["property_name"]:
+            h1_plain = soup.find("h1")
+            if h1_plain:
+                h1_text = h1_plain.get_text(strip=True)
+                m = re.match(r'^(.+?)の賃貸物件情報$', h1_text)
+                if m:
+                    result["property_name"] = _clean_parsed_name(m.group(1))
+
+    # --- title タグフォールバック ---
+    # libraryページの<title>: 「物件名/東京都港区の物件情報【SUUMO】」等
+    if not result["property_name"]:
+        title_tag = soup.find("title")
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            # パターン候補（優先度順）:
+            # - 「物件名/地域の物件情報【SUUMO】」→ 物件名を / の前から抽出
+            # - 「物件名の賃貸物件情報」
+            # - 「物件名 - SUUMO」
+            for pat in [
+                r'^(.+?)/[^/]+の物件情報',  # library: 「物件名/東京都港区の物件情報【SUUMO】」
+                r'^(.+?)の賃貸',
+                r'^(.+?)\s*[-\-–—]\s*SUUMO',
+                r'^(.+?)\s*[|｜]\s*SUUMO',
+                r'^【SUUMO】\s*(.+?)の',
+            ]:
+                m = re.match(pat, title_text)
+                if m:
+                    name = _clean_parsed_name(m.group(1))
+                    if name and len(name) > 1:
+                        result["property_name"] = name
+                        logger.warning(f"SUUMO: titleタグから物件名抽出成功: {name}")
+                        break
+
+    # --- 建物名テーブルフォールバック ---
+    # libraryページのth/tdに「建物名」フィールドがあるケースもある
+    if not result["property_name"]:
+        for key in ["建物名", "物件名", "マンション名", "アパート名"]:
+            if key in table_data:
+                name = _clean_parsed_name(table_data[key])
+                if name:
+                    result["property_name"] = name
+                    break
+
+    # --- meta description フォールバック ---
+    if not result["property_name"]:
+        meta_desc = soup.find("meta", attrs={"name": "description"})
+        if meta_desc and meta_desc.get("content"):
+            desc = meta_desc["content"]
+            # 「物件名の物件情報。SUUMO...」
+            m = re.match(r'^(.+?)の(?:物件情報|賃貸)', desc)
+            if m:
+                name = _clean_parsed_name(m.group(1))
+                if name and len(name) > 1:
+                    result["property_name"] = name
+
+    if not result["property_name"]:
+        logger.warning(f"SUUMO: 物件名抽出失敗 url={fetch_url}")
 
     # --- 住所 ---
     for key in ["所在地", "住所"]:

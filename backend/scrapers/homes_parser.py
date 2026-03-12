@@ -159,7 +159,7 @@ async def _fetch_html_bytes(url: str) -> bytes:
         logger.warning(f"HOMES curlフォールバック失敗: {e}")
 
     # --- Playwright フォールバック ---
-    logger.info("HOMES: Playwrightフォールバックを試行")
+    logger.warning("HOMES: Playwrightフォールバックを試行")
     try:
         content = await _fetch_with_playwright(url)
         if content and len(content) >= _MIN_CONTENT_SIZE:
@@ -202,12 +202,20 @@ async def _fetch_with_playwright(url: str) -> bytes:
 
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # WAFチャレンジのJS実行を待つ（最大10秒）
+            # networkidle状態まで待つ（JS実行完了を確認）
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass  # タイムアウトしても続行
+
+            # WAFチャレンジのJS実行を待つ（最大15秒）
             # WAFが解決すると通常のページに遷移する
-            for _ in range(10):
+            for _ in range(15):
                 content = await page.content()
                 if len(content) > _MIN_CONTENT_SIZE:
-                    break
+                    # "JavaScript is disabled" が含まれなくなるまで待つ
+                    if "JavaScript is disabled" not in content:
+                        break
                 await page.wait_for_timeout(1000)
 
             html_bytes = content.encode("utf-8")
@@ -234,7 +242,12 @@ def _extract_from_html(soup: BeautifulSoup) -> dict:
     for h1 in all_h1:
         text = h1.get_text(strip=True)
         # ナビ用のh1を除外（空やロゴ）
-        if text and len(text) > 2 and "HOME" not in text and "LIFULL" not in text:
+        # 「JavaScript is disabled」も除外（httpx取得時のnoscriptフォールバック）
+        if (text and len(text) > 2
+                and "HOME" not in text
+                and "LIFULL" not in text
+                and "JavaScript" not in text
+                and "javascript" not in text.lower()):
             # カッコ内の付加情報を除去: 「ルカセレーノ（2階/203/ワンルーム/14.17m²）」→「ルカセレーノ」
             name = re.sub(r'[（(].+[）)]$', '', text).strip()
             result["property_name"] = name
@@ -352,12 +365,44 @@ def _extract_from_meta(soup: BeautifulSoup) -> dict:
     return result
 
 
+def _needs_js_rendering(soup: BeautifulSoup) -> bool:
+    """ページがJS無効で正常に取得できなかったかを判定
+
+    httpx/curlで取得した場合、以下のケースでJS必須:
+    - <noscript>タグ内に「JavaScript is disabled」が含まれる
+    - h1が「JavaScript is disabled...」
+    - ページコンテンツに物件情報がほぼない
+    """
+    # noscriptタグの存在チェック
+    noscript = soup.find("noscript")
+    if noscript:
+        ns_text = noscript.get_text(strip=True)
+        if "JavaScript" in ns_text or "javascript" in ns_text.lower():
+            return True
+
+    # h1に「JavaScript」が含まれるかチェック
+    for h1 in soup.find_all("h1"):
+        text = h1.get_text(strip=True)
+        if "JavaScript" in text:
+            return True
+
+    # bodyテキストが極端に短い（通常の物件ページは数千文字）
+    body = soup.find("body")
+    if body:
+        body_text = body.get_text(strip=True)
+        if len(body_text) < 200:
+            return True
+
+    return False
+
+
 async def parse_homes_url(url: str) -> dict:
     """HOMESの物件詳細URLを解析して物件情報を抽出
 
     WAF対策:
     - httpx → リトライ（指数バックオフ）→ curl → Playwright の3段階フォールバック
     - WAFBlockedError時はメタタグからの部分抽出を試みる
+    - JS無効ページ検出時はPlaywrightで再取得
     """
     try:
         html_bytes = await _fetch_html_bytes(url)
@@ -370,6 +415,18 @@ async def parse_homes_url(url: str) -> dict:
 
     soup = BeautifulSoup(html_bytes, "lxml", from_encoding="utf-8")
 
+    # JS無効ページ検出 → Playwrightで再取得
+    if _needs_js_rendering(soup):
+        logger.warning(f"HOMES: JS無効ページ検出、Playwrightで再取得: {url}")
+        try:
+            html_bytes = await _fetch_with_playwright(url)
+            if html_bytes and len(html_bytes) >= _MIN_CONTENT_SIZE:
+                soup = BeautifulSoup(html_bytes, "lxml", from_encoding="utf-8")
+            else:
+                logger.warning(f"HOMES Playwright再取得: コンテンツ不足")
+        except Exception as e:
+            logger.warning(f"HOMES Playwright再取得失敗: {e}")
+
     # メイン抽出
     result = _extract_from_html(soup)
 
@@ -379,5 +436,23 @@ async def parse_homes_url(url: str) -> dict:
         for key, val in meta_result.items():
             if val and not result[key]:
                 result[key] = val
+
+    # 物件名がまだ取れない＋まだPlaywright未試行の場合、最終フォールバック
+    if not result["property_name"] and not _needs_js_rendering(soup):
+        logger.warning(f"HOMES: 物件名抽出失敗、Playwrightフォールバック: {url}")
+        try:
+            html_bytes_pw = await _fetch_with_playwright(url)
+            if html_bytes_pw and len(html_bytes_pw) >= _MIN_CONTENT_SIZE:
+                soup_pw = BeautifulSoup(html_bytes_pw, "lxml", from_encoding="utf-8")
+                result_pw = _extract_from_html(soup_pw)
+                if result_pw["property_name"]:
+                    result = result_pw
+                else:
+                    meta_pw = _extract_from_meta(soup_pw)
+                    for key, val in meta_pw.items():
+                        if val and not result[key]:
+                            result[key] = val
+        except Exception as e:
+            logger.warning(f"HOMES Playwrightフォールバック失敗: {e}")
 
     return result
